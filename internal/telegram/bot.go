@@ -97,10 +97,20 @@ func (b *Bot) handleCommand(ctx context.Context, chatID int64, text string) {
 
 	case "/cancel":
 		b.sessions.Delete(chatID)
-		b.send(ctx, chatID, "Создание подписки отменено.", &ReplyKeyboardRemove{RemoveKeyboard: true})
+		n, err := b.db.DeactivateSubscriptions(ctx, chatID)
+		if err != nil {
+			b.logger.Error("deactivate subscriptions failed", zap.Int64("chat_id", chatID), zap.Error(err))
+			b.send(ctx, chatID, "Произошла ошибка при отмене подписки. Попробуйте позже.", &ReplyKeyboardRemove{RemoveKeyboard: true})
+			return
+		}
+		if n == 0 {
+			b.send(ctx, chatID, "Активных подписок не найдено.", &ReplyKeyboardRemove{RemoveKeyboard: true})
+		} else {
+			b.send(ctx, chatID, "Подписка отменена. Вы больше не будете получать уведомления.", &ReplyKeyboardRemove{RemoveKeyboard: true})
+		}
 
 	default:
-		b.send(ctx, chatID, "Неизвестная команда.\n\nДоступные команды:\n/subscript — создать или обновить подписку\n/cancel — отменить", nil)
+		b.send(ctx, chatID, "Неизвестная команда.\n\nДоступные команды:\n/subscript — создать или обновить подписку\n/cancel — отменить активную подписку", nil)
 	}
 }
 

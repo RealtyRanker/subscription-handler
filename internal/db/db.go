@@ -35,6 +35,19 @@ func (db *DB) Close() {
 	db.pool.Close()
 }
 
+// DeactivateSubscriptions sets is_active = FALSE for all active subscriptions of chatID.
+// Returns the number of rows affected.
+func (db *DB) DeactivateSubscriptions(ctx context.Context, chatID int64) (int64, error) {
+	tag, err := db.pool.Exec(ctx,
+		`UPDATE user_subscriptions SET is_active = FALSE
+		 WHERE chat_id = $1 AND is_active = TRUE`,
+		chatID)
+	if err != nil {
+		return 0, fmt.Errorf("deactivating subscriptions: %w", err)
+	}
+	return tag.RowsAffected(), nil
+}
+
 // UpsertSubscription deactivates any existing active subscription for chatID,
 // then inserts a new one.
 func (db *DB) UpsertSubscription(ctx context.Context, chatID int64, sub Subscription) error {
