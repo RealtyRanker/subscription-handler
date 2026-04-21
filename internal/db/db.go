@@ -52,12 +52,17 @@ func (db *DB) UpsertSubscription(ctx context.Context, chatID int64, sub Subscrip
 		return fmt.Errorf("deactivating old subscription: %w", err)
 	}
 
+	rooms := sub.Rooms
+	if rooms == nil {
+		rooms = []int32{}
+	}
+
 	_, err = tx.Exec(ctx,
 		`INSERT INTO user_subscriptions
 		   (chat_id, min_price, max_price, min_area, max_area, rooms, min_score, is_active)
 		 VALUES ($1, $2, $3, $4, $5, $6, $7, TRUE)`,
 		chatID, sub.MinPrice, sub.MaxPrice,
-		sub.MinArea, sub.MaxArea, sub.Rooms, sub.MinScore)
+		sub.MinArea, sub.MaxArea, rooms, sub.MinScore)
 	if err != nil {
 		return fmt.Errorf("inserting subscription: %w", err)
 	}
