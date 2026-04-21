@@ -56,7 +56,7 @@ logging:
   file_path: "/var/log/subscription-handler/app.log"
 
 metrics:
-  port: 9090
+  port: 9094
 ```
 
 ## Метрики
@@ -106,4 +106,4 @@ docker stop subscription-handler
 
 | Порт на хосте | Порт в контейнере | Назначение |
 |---|---|---|
-| `9094` | `9090` | Метрики и healthz |
+| `9094` | `9094` | Метрики и healthz |

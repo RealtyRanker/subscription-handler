@@ -9,4 +9,4 @@ logging:
   file_path: "/var/log/subscription-handler/app.log"
 
 metrics:
-  port: 9090
+  port: 9094

@@ -20,7 +20,7 @@ docker run -d \
   --name "$APP_CONTAINER" \
   --network "$NETWORK" \
   --restart unless-stopped \
-  -p 9094:9090 \
+  -p 9094:9094 \
   -v "$(pwd)/config.yaml:/app/config.yaml:ro" \
   -v "$LOG_DIR:/var/log/subscription-handler" \
   "$APP_IMAGE"

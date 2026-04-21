@@ -18,6 +18,6 @@ WORKDIR /app
 COPY --from=builder /subscription-handler .
 COPY config.yaml .
 
-EXPOSE 9090
+EXPOSE 9094
 
 CMD ["./subscription-handler", "-config", "config.yaml"]
