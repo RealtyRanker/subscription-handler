@@ -8,6 +8,8 @@ import (
 )
 
 type Subscription struct {
+	ID       int
+	Region   int
 	MinPrice int
 	MaxPrice int
 	MinArea  float64
@@ -35,50 +37,61 @@ func (db *DB) Close() {
 	db.pool.Close()
 }
 
-// DeactivateSubscriptions sets is_active = FALSE for all active subscriptions of chatID.
-// Returns the number of rows affected.
-func (db *DB) DeactivateSubscriptions(ctx context.Context, chatID int64) (int64, error) {
+// DeactivateSubscriptionByID sets is_active = FALSE for the given subscription,
+// scoped to chatID so a chat can only cancel its own subscriptions. Returns
+// whether a row was actually deactivated.
+func (db *DB) DeactivateSubscriptionByID(ctx context.Context, chatID int64, subscriptionID int) (bool, error) {
 	tag, err := db.pool.Exec(ctx,
 		`UPDATE user_subscriptions SET is_active = FALSE
-		 WHERE chat_id = $1 AND is_active = TRUE`,
-		chatID)
+		 WHERE id = $1 AND chat_id = $2 AND is_active = TRUE`,
+		subscriptionID, chatID)
 	if err != nil {
-		return 0, fmt.Errorf("deactivating subscriptions: %w", err)
+		return false, fmt.Errorf("deactivating subscription: %w", err)
 	}
-	return tag.RowsAffected(), nil
+	return tag.RowsAffected() > 0, nil
 }
 
-// UpsertSubscription deactivates any existing active subscription for chatID,
-// then inserts a new one.
-func (db *DB) UpsertSubscription(ctx context.Context, chatID int64, sub Subscription) error {
-	tx, err := db.pool.Begin(ctx)
-	if err != nil {
-		return fmt.Errorf("begin tx: %w", err)
-	}
-	defer tx.Rollback(ctx) //nolint:errcheck
-
-	_, err = tx.Exec(ctx,
-		`UPDATE user_subscriptions SET is_active = FALSE
-		 WHERE chat_id = $1 AND is_active = TRUE`,
-		chatID)
-	if err != nil {
-		return fmt.Errorf("deactivating old subscription: %w", err)
-	}
-
+// CreateSubscription inserts a new active subscription for chatID. Multiple
+// active subscriptions per chatID are allowed.
+func (db *DB) CreateSubscription(ctx context.Context, chatID int64, sub Subscription) error {
 	rooms := sub.Rooms
 	if rooms == nil {
 		rooms = []int32{}
 	}
 
-	_, err = tx.Exec(ctx,
+	_, err := db.pool.Exec(ctx,
 		`INSERT INTO user_subscriptions
-		   (chat_id, min_price, max_price, min_area, max_area, rooms, min_score, is_active)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, TRUE)`,
-		chatID, sub.MinPrice, sub.MaxPrice,
+		   (chat_id, region, min_price, max_price, min_area, max_area, rooms, min_score, is_active)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, TRUE)`,
+		chatID, sub.Region, sub.MinPrice, sub.MaxPrice,
 		sub.MinArea, sub.MaxArea, rooms, sub.MinScore)
 	if err != nil {
 		return fmt.Errorf("inserting subscription: %w", err)
 	}
+	return nil
+}
 
-	return tx.Commit(ctx)
+// GetActiveSubscriptions returns all active subscriptions for chatID, ordered by id.
+func (db *DB) GetActiveSubscriptions(ctx context.Context, chatID int64) ([]Subscription, error) {
+	rows, err := db.pool.Query(ctx,
+		`SELECT id, region, min_price, max_price, min_area, max_area, rooms, min_score
+		 FROM user_subscriptions
+		 WHERE chat_id = $1 AND is_active = TRUE
+		 ORDER BY id`,
+		chatID)
+	if err != nil {
+		return nil, fmt.Errorf("querying subscriptions: %w", err)
+	}
+	defer rows.Close()
+
+	var subs []Subscription
+	for rows.Next() {
+		var s Subscription
+		if err := rows.Scan(&s.ID, &s.Region, &s.MinPrice, &s.MaxPrice,
+			&s.MinArea, &s.MaxArea, &s.Rooms, &s.MinScore); err != nil {
+			return nil, fmt.Errorf("scanning subscription: %w", err)
+		}
+		subs = append(subs, s)
+	}
+	return subs, rows.Err()
 }

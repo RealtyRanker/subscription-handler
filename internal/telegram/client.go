@@ -27,8 +27,9 @@ func NewClient(token string) *Client {
 // --- Incoming types ---
 
 type Update struct {
-	UpdateID int      `json:"update_id"`
-	Message  *Message `json:"message"`
+	UpdateID      int            `json:"update_id"`
+	Message       *Message       `json:"message"`
+	CallbackQuery *CallbackQuery `json:"callback_query"`
 }
 
 type Message struct {
@@ -36,6 +37,13 @@ type Message struct {
 	From      User   `json:"from"`
 	Chat      Chat   `json:"chat"`
 	Text      string `json:"text"`
+}
+
+type CallbackQuery struct {
+	ID      string   `json:"id"`
+	From    User     `json:"from"`
+	Message *Message `json:"message"`
+	Data    string   `json:"data"`
 }
 
 type User struct {
@@ -58,7 +66,7 @@ type apiResponse struct {
 // --- GetUpdates ---
 
 func (c *Client) GetUpdates(ctx context.Context, offset, timeout int) ([]Update, error) {
-	url := fmt.Sprintf("%s/bot%s/getUpdates?offset=%s&timeout=%s&allowed_updates=[\"message\"]",
+	url := fmt.Sprintf("%s/bot%s/getUpdates?offset=%s&timeout=%s&allowed_updates=[\"message\",\"callback_query\"]",
 		apiBase, c.token, strconv.Itoa(offset), strconv.Itoa(timeout))
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
@@ -104,6 +112,15 @@ type ReplyKeyboardRemove struct {
 	RemoveKeyboard bool `json:"remove_keyboard"`
 }
 
+type InlineKeyboardMarkup struct {
+	InlineKeyboard [][]InlineKeyboardButton `json:"inline_keyboard"`
+}
+
+type InlineKeyboardButton struct {
+	Text         string `json:"text"`
+	CallbackData string `json:"callback_data"`
+}
+
 func (c *Client) SendMessage(ctx context.Context, chatID int64, text string, markup interface{}) error {
 	payload, err := json.Marshal(sendMessageRequest{
 		ChatID:      chatID,
@@ -113,9 +130,52 @@ func (c *Client) SendMessage(ctx context.Context, chatID int64, text string, mar
 	if err != nil {
 		return err
 	}
+	return c.call(ctx, "sendMessage", payload)
+}
 
+// --- EditMessageText ---
+
+type editMessageTextRequest struct {
+	ChatID      int64       `json:"chat_id"`
+	MessageID   int         `json:"message_id"`
+	Text        string      `json:"text"`
+	ReplyMarkup interface{} `json:"reply_markup,omitempty"`
+}
+
+func (c *Client) EditMessageText(ctx context.Context, chatID int64, messageID int, text string, markup interface{}) error {
+	payload, err := json.Marshal(editMessageTextRequest{
+		ChatID:      chatID,
+		MessageID:   messageID,
+		Text:        text,
+		ReplyMarkup: markup,
+	})
+	if err != nil {
+		return err
+	}
+	return c.call(ctx, "editMessageText", payload)
+}
+
+// --- AnswerCallbackQuery ---
+
+type answerCallbackQueryRequest struct {
+	CallbackQueryID string `json:"callback_query_id"`
+	Text            string `json:"text,omitempty"`
+}
+
+func (c *Client) AnswerCallbackQuery(ctx context.Context, callbackQueryID, text string) error {
+	payload, err := json.Marshal(answerCallbackQueryRequest{
+		CallbackQueryID: callbackQueryID,
+		Text:            text,
+	})
+	if err != nil {
+		return err
+	}
+	return c.call(ctx, "answerCallbackQuery", payload)
+}
+
+func (c *Client) call(ctx context.Context, method string, payload []byte) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		fmt.Sprintf("%s/bot%s/sendMessage", apiBase, c.token),
+		fmt.Sprintf("%s/bot%s/%s", apiBase, c.token, method),
 		bytes.NewReader(payload))
 	if err != nil {
 		return err

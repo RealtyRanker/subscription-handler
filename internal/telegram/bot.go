@@ -15,13 +15,15 @@ import (
 	"github.com/asmisnik/subscription-handler/internal/session"
 )
 
+const regionsPerPage = 10
+
 var stepQuestions = map[session.Step]string{
-	session.StepMinPrice: "Шаг 1/6 — Минимальная цена аренды (₽)?\n\nВведите число или 0, чтобы не ограничивать.",
-	session.StepMaxPrice: "Шаг 2/6 — Максимальная цена аренды (₽)?\n\nВведите число или 0, чтобы не ограничивать.",
-	session.StepMinArea:  "Шаг 3/6 — Минимальная площадь (м²)?\n\nВведите число или 0, чтобы не ограничивать.",
-	session.StepMaxArea:  "Шаг 4/6 — Максимальная площадь (м²)?\n\nВведите число или 0, чтобы не ограничивать.",
-	session.StepRooms:    "Шаг 5/6 — Количество комнат?\n\nВведите числа через пробел или запятую (например: 2 3 или 1,2,3).\nОтправьте 0, чтобы не фильтровать по комнатам.",
-	session.StepMinScore: "Шаг 6/6 — Минимальный скор квартиры?\n\nВведите число или 0, чтобы не ограничивать.",
+	session.StepMinPrice: "Шаг 2/7 — Минимальная цена аренды (₽)?\n\nВведите число или 0, чтобы не ограничивать.",
+	session.StepMaxPrice: "Шаг 3/7 — Максимальная цена аренды (₽)?\n\nВведите число или 0, чтобы не ограничивать.",
+	session.StepMinArea:  "Шаг 4/7 — Минимальная площадь (м²)?\n\nВведите число или 0, чтобы не ограничивать.",
+	session.StepMaxArea:  "Шаг 5/7 — Максимальная площадь (м²)?\n\nВведите число или 0, чтобы не ограничивать.",
+	session.StepRooms:    "Шаг 6/7 — Количество комнат?\n\nВведите числа через пробел или запятую (например: 2 3 или 1,2,3).\nОтправьте 0, чтобы не фильтровать по комнатам.",
+	session.StepMinScore: "Шаг 7/7 — Минимальный скор квартиры?\n\nВведите число или 0, чтобы не ограничивать.",
 }
 
 type Bot struct {
@@ -56,6 +58,9 @@ func (b *Bot) Run(ctx context.Context) {
 		for _, u := range updates {
 			if u.Message != nil {
 				b.handleMessage(ctx, u.Message)
+			}
+			if u.CallbackQuery != nil {
+				b.handleCallbackQuery(ctx, u.CallbackQuery)
 			}
 			offset = u.UpdateID + 1
 		}
@@ -92,25 +97,31 @@ func (b *Bot) handleCommand(ctx context.Context, chatID int64, text string) {
 
 	switch cmd {
 	case "/subscript", "/subscript@" + "":
-		b.sessions.Set(chatID, &session.Session{Step: session.StepMinPrice})
-		b.sendQuestion(ctx, chatID, session.StepMinPrice)
+		b.sessions.Set(chatID, &session.Session{Step: session.StepRegion})
+		b.sendRegionPage(ctx, chatID, 0)
 
 	case "/cancel":
 		b.sessions.Delete(chatID)
-		n, err := b.db.DeactivateSubscriptions(ctx, chatID)
+		subs, err := b.db.GetActiveSubscriptions(ctx, chatID)
 		if err != nil {
-			b.logger.Error("deactivate subscriptions failed", zap.Int64("chat_id", chatID), zap.Error(err))
-			b.send(ctx, chatID, "Произошла ошибка при отмене подписки. Попробуйте позже.", &ReplyKeyboardRemove{RemoveKeyboard: true})
+			b.logger.Error("fetching active subscriptions failed", zap.Int64("chat_id", chatID), zap.Error(err))
+			b.send(ctx, chatID, "Произошла ошибка. Попробуйте позже.", nil)
 			return
 		}
-		if n == 0 {
-			b.send(ctx, chatID, "Активных подписок не найдено.", &ReplyKeyboardRemove{RemoveKeyboard: true})
-		} else {
-			b.send(ctx, chatID, "Подписка отменена. Вы больше не будете получать уведомления.", &ReplyKeyboardRemove{RemoveKeyboard: true})
+		if len(subs) == 0 {
+			b.send(ctx, chatID, "Активных подписок не найдено.", nil)
+			return
 		}
+		rows := make([][]InlineKeyboardButton, 0, len(subs))
+		for _, s := range subs {
+			rows = append(rows, []InlineKeyboardButton{
+				{Text: subscriptionBrief(s), CallbackData: fmt.Sprintf("cancel:%d", s.ID)},
+			})
+		}
+		b.send(ctx, chatID, "Выберите подписку, которую нужно отменить:", &InlineKeyboardMarkup{InlineKeyboard: rows})
 
 	default:
-		b.send(ctx, chatID, "Неизвестная команда.\n\nДоступные команды:\n/subscript — создать или обновить подписку\n/cancel — отменить активную подписку", nil)
+		b.send(ctx, chatID, "Неизвестная команда.\n\nДоступные команды:\n/subscript — создать новую подписку\n/cancel — отменить одну из активных подписок", nil)
 	}
 }
 
@@ -118,6 +129,10 @@ func (b *Bot) handleAnswer(ctx context.Context, chatID int64, sess *session.Sess
 	var err error
 
 	switch sess.Step {
+	case session.StepRegion:
+		b.send(ctx, chatID, "Пожалуйста, выберите регион, нажав на кнопку в списке выше.", nil)
+		return
+
 	case session.StepMinPrice:
 		sess.MinPrice, err = parseInt(text)
 		if err != nil {
@@ -176,8 +191,142 @@ func (b *Bot) handleAnswer(ctx context.Context, chatID int64, sess *session.Sess
 	b.sessions.Set(chatID, sess)
 }
 
+// handleCallbackQuery routes inline-keyboard button presses: "pg:"/"rgn:" for
+// the region selector in the subscription wizard, "cancel:" for picking which
+// active subscription to cancel.
+func (b *Bot) handleCallbackQuery(ctx context.Context, cq *CallbackQuery) {
+	if cq.Message == nil {
+		return
+	}
+	chatID := cq.Message.Chat.ID
+
+	switch {
+	case strings.HasPrefix(cq.Data, "pg:"), strings.HasPrefix(cq.Data, "rgn:"):
+		b.handleRegionCallback(ctx, chatID, cq)
+	case strings.HasPrefix(cq.Data, "cancel:"):
+		b.handleCancelCallback(ctx, chatID, cq)
+	}
+}
+
+// handleRegionCallback processes the region selector: "pg:<page>" switches
+// the displayed page, "rgn:<id>" picks a region and advances the wizard.
+func (b *Bot) handleRegionCallback(ctx context.Context, chatID int64, cq *CallbackQuery) {
+	sess := b.sessions.Get(chatID)
+	if sess == nil || sess.Step != session.StepRegion {
+		b.answerCallback(ctx, cq.ID, "Сессия устарела. Отправьте /subscript, чтобы начать заново.")
+		return
+	}
+
+	switch {
+	case strings.HasPrefix(cq.Data, "pg:"):
+		page, err := strconv.Atoi(strings.TrimPrefix(cq.Data, "pg:"))
+		if err != nil {
+			b.answerCallback(ctx, cq.ID, "")
+			return
+		}
+		b.answerCallback(ctx, cq.ID, "")
+		text, markup := regionPageContent(page)
+		if err := b.client.EditMessageText(ctx, chatID, cq.Message.MessageID, text, markup); err != nil {
+			b.logger.Warn("edit message failed", zap.Int64("chat_id", chatID), zap.Error(err))
+		}
+
+	case strings.HasPrefix(cq.Data, "rgn:"):
+		id, err := strconv.Atoi(strings.TrimPrefix(cq.Data, "rgn:"))
+		if err != nil {
+			b.answerCallback(ctx, cq.ID, "")
+			return
+		}
+		sess.Region = id
+		sess.Step = session.StepMinPrice
+		b.sessions.Set(chatID, sess)
+		b.answerCallback(ctx, cq.ID, "")
+		if err := b.client.EditMessageText(ctx, chatID, cq.Message.MessageID, "📍 Регион: "+regionName(id), nil); err != nil {
+			b.logger.Warn("edit message failed", zap.Int64("chat_id", chatID), zap.Error(err))
+		}
+		b.sendQuestion(ctx, chatID, session.StepMinPrice)
+	}
+}
+
+// handleCancelCallback processes "cancel:<subscription_id>" button presses
+// from the /cancel selector.
+func (b *Bot) handleCancelCallback(ctx context.Context, chatID int64, cq *CallbackQuery) {
+	id, err := strconv.Atoi(strings.TrimPrefix(cq.Data, "cancel:"))
+	if err != nil {
+		b.answerCallback(ctx, cq.ID, "")
+		return
+	}
+
+	ok, err := b.db.DeactivateSubscriptionByID(ctx, chatID, id)
+	if err != nil {
+		b.logger.Error("deactivate subscription failed", zap.Int64("chat_id", chatID), zap.Int("subscription_id", id), zap.Error(err))
+		b.answerCallback(ctx, cq.ID, "Произошла ошибка при отмене подписки.")
+		return
+	}
+	if !ok {
+		b.answerCallback(ctx, cq.ID, "Подписка уже отменена или не найдена.")
+		return
+	}
+
+	b.answerCallback(ctx, cq.ID, "Подписка отменена")
+	if err := b.client.EditMessageText(ctx, chatID, cq.Message.MessageID, "🚫 Подписка отменена. Вы больше не будете получать по ней уведомления.", nil); err != nil {
+		b.logger.Warn("edit message failed", zap.Int64("chat_id", chatID), zap.Error(err))
+	}
+}
+
+func (b *Bot) answerCallback(ctx context.Context, callbackQueryID, text string) {
+	if err := b.client.AnswerCallbackQuery(ctx, callbackQueryID, text); err != nil {
+		b.logger.Warn("answer callback query failed", zap.Error(err))
+	}
+}
+
+// sendRegionPage sends a new message showing the region selector at the given page.
+func (b *Bot) sendRegionPage(ctx context.Context, chatID int64, page int) {
+	text, markup := regionPageContent(page)
+	b.send(ctx, chatID, text, markup)
+}
+
+// regionPageContent renders the region selector text and inline keyboard for
+// a 0-indexed page of session.Regions.
+func regionPageContent(page int) (string, *InlineKeyboardMarkup) {
+	totalPages := (len(session.Regions) + regionsPerPage - 1) / regionsPerPage
+	if page < 0 {
+		page = 0
+	}
+	if page > totalPages-1 {
+		page = totalPages - 1
+	}
+
+	start := page * regionsPerPage
+	end := start + regionsPerPage
+	if end > len(session.Regions) {
+		end = len(session.Regions)
+	}
+
+	rows := make([][]InlineKeyboardButton, 0, regionsPerPage+1)
+	for _, r := range session.Regions[start:end] {
+		rows = append(rows, []InlineKeyboardButton{
+			{Text: r.Name, CallbackData: fmt.Sprintf("rgn:%d", r.ID)},
+		})
+	}
+
+	var navRow []InlineKeyboardButton
+	if page > 0 {
+		navRow = append(navRow, InlineKeyboardButton{Text: "◀ Назад", CallbackData: fmt.Sprintf("pg:%d", page-1)})
+	}
+	if page < totalPages-1 {
+		navRow = append(navRow, InlineKeyboardButton{Text: "Далее ▶", CallbackData: fmt.Sprintf("pg:%d", page+1)})
+	}
+	if len(navRow) > 0 {
+		rows = append(rows, navRow)
+	}
+
+	text := fmt.Sprintf("Шаг 1/7 — Выберите регион (страница %d/%d):", page+1, totalPages)
+	return text, &InlineKeyboardMarkup{InlineKeyboard: rows}
+}
+
 func (b *Bot) finalize(ctx context.Context, chatID int64, sess *session.Session) {
 	sub := db.Subscription{
+		Region:   sess.Region,
 		MinPrice: sess.MinPrice,
 		MaxPrice: sess.MaxPrice,
 		MinArea:  sess.MinArea,
@@ -186,8 +335,8 @@ func (b *Bot) finalize(ctx context.Context, chatID int64, sess *session.Session)
 		MinScore: sess.MinScore,
 	}
 
-	if err := b.db.UpsertSubscription(ctx, chatID, sub); err != nil {
-		b.logger.Error("upsert subscription failed", zap.Int64("chat_id", chatID), zap.Error(err))
+	if err := b.db.CreateSubscription(ctx, chatID, sub); err != nil {
+		b.logger.Error("create subscription failed", zap.Int64("chat_id", chatID), zap.Error(err))
 		b.send(ctx, chatID, "Произошла ошибка при сохранении подписки. Попробуйте позже.", &ReplyKeyboardRemove{RemoveKeyboard: true})
 		return
 	}
@@ -262,6 +411,9 @@ func parseRooms(s string) ([]int32, error) {
 
 func formatSubscriptionSummary(sub db.Subscription) string {
 	var sb strings.Builder
+	if name := regionName(sub.Region); name != "" {
+		sb.WriteString("📍 Регион: " + name + "\n")
+	}
 	if sub.MinPrice > 0 || sub.MaxPrice > 0 {
 		sb.WriteString(fmt.Sprintf("💰 Цена: %s — %s ₽\n",
 			fmtOrAny(sub.MinPrice), fmtOrAny(sub.MaxPrice)))
@@ -284,6 +436,37 @@ func formatSubscriptionSummary(sub db.Subscription) string {
 		sb.WriteString("Без фильтров — будут присылаться все объявления.")
 	}
 	return sb.String()
+}
+
+// subscriptionBrief renders a short one-line summary of a subscription for
+// use as an inline-keyboard button label in the /cancel selector.
+func subscriptionBrief(sub db.Subscription) string {
+	parts := []string{regionName(sub.Region)}
+
+	if sub.MinPrice > 0 || sub.MaxPrice > 0 {
+		parts = append(parts, fmt.Sprintf("%s-%s₽", fmtOrAny(sub.MinPrice), fmtOrAny(sub.MaxPrice)))
+	}
+	if len(sub.Rooms) > 0 {
+		roomParts := make([]string, len(sub.Rooms))
+		for i, r := range sub.Rooms {
+			roomParts[i] = strconv.Itoa(int(r))
+		}
+		parts = append(parts, strings.Join(roomParts, ",")+"к")
+	}
+	if sub.MinScore > 0 {
+		parts = append(parts, fmt.Sprintf("скор≥%d", sub.MinScore))
+	}
+
+	return strings.Join(parts, ", ")
+}
+
+func regionName(regionID int) string {
+	for _, r := range session.Regions {
+		if r.ID == regionID {
+			return r.Name
+		}
+	}
+	return ""
 }
 
 func fmtOrAny(v int) string {

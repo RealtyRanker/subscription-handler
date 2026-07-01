@@ -6,6 +6,7 @@ type Step int
 
 const (
 	StepIdle Step = iota
+	StepRegion
 	StepMinPrice
 	StepMaxPrice
 	StepMinArea
@@ -16,6 +17,7 @@ const (
 
 type Session struct {
 	Step     Step
+	Region   int
 	MinPrice int
 	MaxPrice int
 	MinArea  float64
