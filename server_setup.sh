@@ -22,6 +22,7 @@ docker run -d \
   --restart unless-stopped \
   -p 9094:9094 \
   -v "$(pwd)/config.yaml:/app/config.yaml:ro" \
+  -v "$(pwd)/bot_token:/etc/subscription-handler/bot_token:ro" \
   -v "$LOG_DIR:/var/log/subscription-handler" \
   "$APP_IMAGE"
 
