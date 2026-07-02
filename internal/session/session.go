@@ -217,7 +217,7 @@ type Session struct {
 	MaxPrice int
 	MinArea  float64
 	MaxArea  float64
-	Rooms    []int32
+	Rooms    []int64
 
 	ScoringMode      string
 	ScoringParams    ScoringParams

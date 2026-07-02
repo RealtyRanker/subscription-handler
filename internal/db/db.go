@@ -17,7 +17,7 @@ type Subscription struct {
 	MaxPrice         int
 	MinArea          float64
 	MaxArea          float64
-	Rooms            []int32
+	Rooms            []int64
 	MinScore         int
 
 	// Extended filters (zero-valued when not set, meaning "no filter").
@@ -91,7 +91,7 @@ type ReportSubscription struct {
 	MaxPrice         int
 	MinArea          float64
 	MaxArea          float64
-	Rooms            []int32
+	Rooms            []int64
 	MinScore         int
 
 	MinUndergroundPlace int
@@ -149,7 +149,7 @@ func (db *DB) DeactivateSubscriptionByID(ctx context.Context, chatID int64, subs
 func (db *DB) CreateSubscription(ctx context.Context, chatID int64, sub Subscription) error {
 	rooms := sub.Rooms
 	if rooms == nil {
-		rooms = []int32{}
+		rooms = []int64{}
 	}
 	metroStations := sub.MetroStations
 	if metroStations == nil {
@@ -263,7 +263,7 @@ func (db *DB) GetActiveSubscriptions(ctx context.Context, chatID int64) ([]Subsc
 func (db *DB) CreateReportSubscription(ctx context.Context, chatID int64, sub Subscription, periodSeconds int) error {
 	rooms := sub.Rooms
 	if rooms == nil {
-		rooms = []int32{}
+		rooms = []int64{}
 	}
 	metroStations := sub.MetroStations
 	if metroStations == nil {

@@ -1795,7 +1795,7 @@ func parseStationNames(s string) []string {
 	return names
 }
 
-func parseRooms(s string) ([]int32, error) {
+func parseRooms(s string) ([]int64, error) {
 	s = strings.TrimSpace(s)
 	// Treat "0" as "no filter"
 	if s == "0" {
@@ -1809,13 +1809,13 @@ func parseRooms(s string) ([]int32, error) {
 	if len(parts) == 0 {
 		return nil, fmt.Errorf("empty input")
 	}
-	var rooms []int32
+	var rooms []int64
 	for _, p := range parts {
-		v, err := strconv.Atoi(strings.TrimSpace(p))
+		v, err := strconv.ParseInt(strings.TrimSpace(p), 10, 64)
 		if err != nil || v < 1 {
 			return nil, fmt.Errorf("invalid room number: %q", p)
 		}
-		rooms = append(rooms, int32(v))
+		rooms = append(rooms, v)
 	}
 	return rooms, nil
 }
@@ -1875,7 +1875,7 @@ func formatSubscriptionSummary(sub db.Subscription) string {
 	if len(sub.Rooms) > 0 {
 		parts := make([]string, len(sub.Rooms))
 		for i, r := range sub.Rooms {
-			parts[i] = strconv.Itoa(int(r))
+			parts[i] = strconv.FormatInt(r, 10)
 		}
 		sb.WriteString("🚪 Комнат: " + strings.Join(parts, ", ") + "\n")
 	}
@@ -2001,7 +2001,7 @@ func subscriptionBrief(sub db.Subscription) string {
 	if len(sub.Rooms) > 0 {
 		roomParts := make([]string, len(sub.Rooms))
 		for i, r := range sub.Rooms {
-			roomParts[i] = strconv.Itoa(int(r))
+			roomParts[i] = strconv.FormatInt(r, 10)
 		}
 		parts = append(parts, strings.Join(roomParts, ",")+"к")
 	}
@@ -2032,7 +2032,7 @@ func reportSubscriptionBrief(sub db.ReportSubscription) string {
 	if len(sub.Rooms) > 0 {
 		roomParts := make([]string, len(sub.Rooms))
 		for i, r := range sub.Rooms {
-			roomParts[i] = strconv.Itoa(int(r))
+			roomParts[i] = strconv.FormatInt(r, 10)
 		}
 		parts = append(parts, strings.Join(roomParts, ",")+"к")
 	}
