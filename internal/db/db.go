@@ -8,15 +8,17 @@ import (
 )
 
 type Subscription struct {
-	ID       int
-	DealType string
-	Region   int
-	MinPrice int
-	MaxPrice int
-	MinArea  float64
-	MaxArea  float64
-	Rooms    []int32
-	MinScore int
+	ID               int
+	DealType         string
+	Region           int
+	MetroStations    []string
+	MetroFilterLabel string // e.g. "Округа: Восточный, Южный"; empty if no metro filter
+	MinPrice         int
+	MaxPrice         int
+	MinArea          float64
+	MaxArea          float64
+	Rooms            []int32
+	MinScore         int
 
 	// Extended filters (zero-valued when not set, meaning "no filter").
 	MinUndergroundPlace int
@@ -35,6 +37,11 @@ type Subscription struct {
 	// ScoringParams is nil for default scoring, or the 18 custom weights
 	// stored in subscription_scoring_params otherwise.
 	ScoringParams *ScoringParams
+
+	// PriorityStations holds the canonical station names named when the
+	// subscriber chose the "priority stations" scoring option (report
+	// subscriptions never set this — always empty for them).
+	PriorityStations []string
 }
 
 // ScoringParams holds the 18 customizable scoring multipliers a subscriber
@@ -67,15 +74,17 @@ type ScoringParams struct {
 // filters as Subscription (minus scoring params, which reports don't
 // support), plus a send period and the last-sent timestamp.
 type ReportSubscription struct {
-	ID       int
-	DealType string
-	Region   int
-	MinPrice int
-	MaxPrice int
-	MinArea  float64
-	MaxArea  float64
-	Rooms    []int32
-	MinScore int
+	ID               int
+	DealType         string
+	Region           int
+	MetroStations    []string
+	MetroFilterLabel string
+	MinPrice         int
+	MaxPrice         int
+	MinArea          float64
+	MaxArea          float64
+	Rooms            []int32
+	MinScore         int
 
 	MinUndergroundPlace int
 	MinKitchenArea      float64
@@ -134,6 +143,14 @@ func (db *DB) CreateSubscription(ctx context.Context, chatID int64, sub Subscrip
 	if rooms == nil {
 		rooms = []int32{}
 	}
+	metroStations := sub.MetroStations
+	if metroStations == nil {
+		metroStations = []string{}
+	}
+	priorityStations := sub.PriorityStations
+	if priorityStations == nil {
+		priorityStations = []string{}
+	}
 
 	tx, err := db.pool.Begin(ctx)
 	if err != nil {
@@ -147,17 +164,19 @@ func (db *DB) CreateSubscription(ctx context.Context, chatID int64, sub Subscrip
 		   (chat_id, deal_type, region, min_price, max_price, min_area, max_area, rooms, min_score,
 		    min_underground_place, min_kitchen_area, min_floor, max_floor, min_ceiling_height,
 		    children_required, pets_required, dishwasher_required, conditioner_required,
-		    min_renovation, balcony_required, bathroom_type, is_active)
+		    min_renovation, balcony_required, bathroom_type, metro_stations, metro_filter_label,
+		    priority_stations, is_active)
 		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9,
 		         $10, $11, $12, $13, $14,
 		         $15, $16, $17, $18,
-		         $19, $20, $21, TRUE)
+		         $19, $20, $21, $22, $23, $24, TRUE)
 		 RETURNING id`,
 		chatID, sub.DealType, sub.Region, sub.MinPrice, sub.MaxPrice,
 		sub.MinArea, sub.MaxArea, rooms, sub.MinScore,
 		sub.MinUndergroundPlace, sub.MinKitchenArea, sub.MinFloor, sub.MaxFloor, sub.MinCeilingHeight,
 		sub.ChildrenRequired, sub.PetsRequired, sub.DishwasherRequired, sub.ConditionerRequired,
-		sub.MinRenovation, sub.BalconyRequired, sub.BathroomType,
+		sub.MinRenovation, sub.BalconyRequired, sub.BathroomType, metroStations, sub.MetroFilterLabel,
+		priorityStations,
 	).Scan(&subscriptionID)
 	if err != nil {
 		return fmt.Errorf("inserting subscription: %w", err)
@@ -195,7 +214,8 @@ func (db *DB) GetActiveSubscriptions(ctx context.Context, chatID int64) ([]Subsc
 		`SELECT id, deal_type, region, min_price, max_price, min_area, max_area, rooms, min_score,
 		        min_underground_place, min_kitchen_area, min_floor, max_floor, min_ceiling_height,
 		        children_required, pets_required, dishwasher_required, conditioner_required,
-		        min_renovation, balcony_required, bathroom_type
+		        min_renovation, balcony_required, bathroom_type, metro_stations, metro_filter_label,
+		        priority_stations
 		 FROM user_subscriptions
 		 WHERE chat_id = $1 AND is_active = TRUE
 		 ORDER BY id`,
@@ -212,7 +232,8 @@ func (db *DB) GetActiveSubscriptions(ctx context.Context, chatID int64) ([]Subsc
 			&s.MinArea, &s.MaxArea, &s.Rooms, &s.MinScore,
 			&s.MinUndergroundPlace, &s.MinKitchenArea, &s.MinFloor, &s.MaxFloor, &s.MinCeilingHeight,
 			&s.ChildrenRequired, &s.PetsRequired, &s.DishwasherRequired, &s.ConditionerRequired,
-			&s.MinRenovation, &s.BalconyRequired, &s.BathroomType); err != nil {
+			&s.MinRenovation, &s.BalconyRequired, &s.BathroomType, &s.MetroStations, &s.MetroFilterLabel,
+			&s.PriorityStations); err != nil {
 			return nil, fmt.Errorf("scanning subscription: %w", err)
 		}
 		subs = append(subs, s)
@@ -228,22 +249,27 @@ func (db *DB) CreateReportSubscription(ctx context.Context, chatID int64, sub Su
 	if rooms == nil {
 		rooms = []int32{}
 	}
+	metroStations := sub.MetroStations
+	if metroStations == nil {
+		metroStations = []string{}
+	}
 
 	_, err := db.pool.Exec(ctx,
 		`INSERT INTO report_user_subscriptions
 		   (chat_id, deal_type, region, min_price, max_price, min_area, max_area, rooms, min_score,
 		    min_underground_place, min_kitchen_area, min_floor, max_floor, min_ceiling_height,
 		    children_required, pets_required, dishwasher_required, conditioner_required,
-		    min_renovation, balcony_required, bathroom_type, period_seconds, is_active)
+		    min_renovation, balcony_required, bathroom_type, metro_stations, metro_filter_label,
+		    period_seconds, is_active)
 		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9,
 		         $10, $11, $12, $13, $14,
 		         $15, $16, $17, $18,
-		         $19, $20, $21, $22, TRUE)`,
+		         $19, $20, $21, $22, $23, $24, TRUE)`,
 		chatID, sub.DealType, sub.Region, sub.MinPrice, sub.MaxPrice,
 		sub.MinArea, sub.MaxArea, rooms, sub.MinScore,
 		sub.MinUndergroundPlace, sub.MinKitchenArea, sub.MinFloor, sub.MaxFloor, sub.MinCeilingHeight,
 		sub.ChildrenRequired, sub.PetsRequired, sub.DishwasherRequired, sub.ConditionerRequired,
-		sub.MinRenovation, sub.BalconyRequired, sub.BathroomType, periodSeconds,
+		sub.MinRenovation, sub.BalconyRequired, sub.BathroomType, metroStations, sub.MetroFilterLabel, periodSeconds,
 	)
 	if err != nil {
 		return fmt.Errorf("inserting report subscription: %w", err)
@@ -258,7 +284,7 @@ func (db *DB) GetActiveReportSubscriptions(ctx context.Context, chatID int64) ([
 		`SELECT id, deal_type, region, min_price, max_price, min_area, max_area, rooms, min_score,
 		        min_underground_place, min_kitchen_area, min_floor, max_floor, min_ceiling_height,
 		        children_required, pets_required, dishwasher_required, conditioner_required,
-		        min_renovation, balcony_required, bathroom_type, period_seconds
+		        min_renovation, balcony_required, bathroom_type, metro_stations, metro_filter_label, period_seconds
 		 FROM report_user_subscriptions
 		 WHERE chat_id = $1 AND is_active = TRUE
 		 ORDER BY id`,
@@ -275,7 +301,8 @@ func (db *DB) GetActiveReportSubscriptions(ctx context.Context, chatID int64) ([
 			&s.MinArea, &s.MaxArea, &s.Rooms, &s.MinScore,
 			&s.MinUndergroundPlace, &s.MinKitchenArea, &s.MinFloor, &s.MaxFloor, &s.MinCeilingHeight,
 			&s.ChildrenRequired, &s.PetsRequired, &s.DishwasherRequired, &s.ConditionerRequired,
-			&s.MinRenovation, &s.BalconyRequired, &s.BathroomType, &s.PeriodSeconds); err != nil {
+			&s.MinRenovation, &s.BalconyRequired, &s.BathroomType, &s.MetroStations, &s.MetroFilterLabel,
+			&s.PeriodSeconds); err != nil {
 			return nil, fmt.Errorf("scanning report subscription: %w", err)
 		}
 		subs = append(subs, s)

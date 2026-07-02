@@ -7,42 +7,65 @@ import (
 	"strings"
 	"time"
 	"unicode"
+	"unicode/utf8"
 
 	"go.uber.org/zap"
 
 	"github.com/asmisnik/subscription-handler/internal/db"
 	"github.com/asmisnik/subscription-handler/internal/metrics"
+	"github.com/asmisnik/subscription-handler/internal/metro"
 	"github.com/asmisnik/subscription-handler/internal/session"
 )
 
 const regionsPerPage = 10
+const stationsPerPage = 50
+const districtsPerPage = 30
 
 // fixedSubscriptionSteps/fixedReportSteps list the main (non-extended,
 // non-scoring) wizard steps in order for each wizard kind, used to compute
-// "Шаг N/M" numbering. Both happen to total 10: the report wizard swaps
-// StepScoringMode (subscription-only) for StepReportPeriod (report-only).
+// "Шаг N/M" numbering. StepMinScore is not listed here: it's asked as the
+// last custom-scoring question (see session.ScoringSteps) and skipped
+// entirely when the default scoring formula is used.
 var fixedSubscriptionSteps = []session.Step{
-	session.StepDealType, session.StepRegion, session.StepFilterMode,
+	session.StepDealType, session.StepRegion, session.StepLocationFilterType, session.StepFilterMode,
 	session.StepMinPrice, session.StepMaxPrice, session.StepMinArea, session.StepMaxArea,
-	session.StepRooms, session.StepScoringMode, session.StepMinScore,
+	session.StepRooms, session.StepScoringMode,
 }
 
 var fixedReportSteps = []session.Step{
-	session.StepDealType, session.StepReportPeriod, session.StepRegion, session.StepFilterMode,
+	session.StepDealType, session.StepReportPeriod, session.StepRegion, session.StepLocationFilterType, session.StepFilterMode,
 	session.StepMinPrice, session.StepMaxPrice, session.StepMinArea, session.StepMaxArea,
-	session.StepRooms, session.StepMinScore,
+	session.StepRooms,
 }
 
-func fixedSteps(kind string) []session.Step {
-	if kind == session.KindReport {
-		return fixedReportSteps
+// moscowRegionID is the only region the metro-based location filter applies
+// to; other regions skip StepLocationFilterType entirely.
+const moscowRegionID = 1
+
+// fixedSteps returns the fixed wizard steps for sess, dropping
+// StepLocationFilterType outside Moscow (region unset counts as Moscow so
+// the step still shows before the user has picked a region).
+func fixedSteps(sess *session.Session) []session.Step {
+	steps := fixedSubscriptionSteps
+	if sess.Kind == session.KindReport {
+		steps = fixedReportSteps
 	}
-	return fixedSubscriptionSteps
+	if sess.Region != 0 && sess.Region != moscowRegionID {
+		filtered := make([]session.Step, 0, len(steps)-1)
+		for _, s := range steps {
+			if s == session.StepLocationFilterType {
+				continue
+			}
+			filtered = append(filtered, s)
+		}
+		return filtered
+	}
+	return steps
 }
 
-// stepNumber returns the 1-based position of step in kind's fixed step list.
-func stepNumber(step session.Step, kind string) int {
-	for i, s := range fixedSteps(kind) {
+// stepNumber returns the 1-based position of step in sess's fixed step list.
+func stepNumber(step session.Step, sess *session.Session) int {
+	for i, s := range fixedSteps(sess) {
 		if s == step {
 			return i + 1
 		}
@@ -50,8 +73,8 @@ func stepNumber(step session.Step, kind string) int {
 	return 0
 }
 
-func totalSteps(kind string) int {
-	return len(fixedSteps(kind))
+func totalSteps(sess *session.Session) int {
+	return len(fixedSteps(sess))
 }
 
 // stepQuestionBody holds the question body (without "Шаг N/M —" numbering)
@@ -63,7 +86,6 @@ var stepQuestionBody = map[session.Step]string{
 	session.StepMinArea:  "Минимальная площадь (м²)?\n\nВведите число или 0, чтобы не ограничивать.",
 	session.StepMaxArea:  "Максимальная площадь (м²)?\n\nВведите число или 0, чтобы не ограничивать.",
 	session.StepRooms:    "Количество комнат?\n\nВведите числа через пробел или запятую (например: 2 3 или 1,2,3).\nОтправьте 0, чтобы не фильтровать по комнатам.",
-	session.StepMinScore: "Минимальный скор квартиры?\n\nВведите число или 0, чтобы не ограничивать.",
 }
 
 // extendedStepQuestions holds the (kind-independent, unnumbered) question
@@ -258,6 +280,11 @@ func nextStep(current session.Step, sess *session.Session) session.Step {
 	case session.StepReportPeriod:
 		return session.StepRegion
 	case session.StepRegion:
+		if sess.Region != moscowRegionID {
+			return session.StepFilterMode
+		}
+		return session.StepLocationFilterType
+	case session.StepLocationFilterType:
 		return session.StepFilterMode
 	case session.StepFilterMode:
 		return session.StepMinPrice
@@ -271,19 +298,23 @@ func nextStep(current session.Step, sess *session.Session) session.Step {
 		return session.StepRooms
 	case session.StepRooms:
 		if sess.Kind == session.KindReport {
-			return session.StepMinScore
+			// Report subscriptions always use the default scoring formula,
+			// so the min-score question (part of the custom-scoring flow) is
+			// skipped entirely.
+			return afterScoring(sess)
 		}
 		return session.StepScoringMode
 	case session.StepScoringMode:
-		if sess.ScoringMode == session.ScoringModeCustom {
+		switch sess.ScoringMode {
+		case session.ScoringModeCustom:
 			return session.ScoringSteps[0]
+		case session.ScoringModePriority:
+			return session.StepPriorityStations
+		default:
+			return afterScoring(sess)
 		}
-		return session.StepMinScore
-	case session.StepMinScore:
-		if sess.FilterMode != session.FilterModeExtended {
-			return session.StepDone
-		}
-		return session.StepMinUndergroundPlace
+	case session.StepPriorityStations:
+		return afterScoring(sess)
 	case session.StepMinUndergroundPlace:
 		return session.StepMinKitchenArea
 	case session.StepMinKitchenArea:
@@ -316,10 +347,21 @@ func nextStep(current session.Step, sess *session.Session) session.Step {
 			if idx+1 < len(session.ScoringSteps) {
 				return session.ScoringSteps[idx+1]
 			}
-			return session.StepMinScore
+			// Just answered StepMinScore, the last custom-scoring question.
+			return afterScoring(sess)
 		}
 		return session.StepDone
 	}
+}
+
+// afterScoring returns the step that follows the scoring stage (whether the
+// user took the default formula or finished the custom-scoring questions),
+// branching into the extended filters if requested.
+func afterScoring(sess *session.Session) session.Step {
+	if sess.FilterMode != session.FilterModeExtended {
+		return session.StepDone
+	}
+	return session.StepMinUndergroundPlace
 }
 
 // advance moves the session to the given step and renders whatever prompt
@@ -335,14 +377,28 @@ func (b *Bot) advance(ctx context.Context, chatID int64, sess *session.Session, 
 		b.sendReportPeriodQuestion(ctx, chatID, sess)
 	case session.StepRegion:
 		b.sendRegionPage(ctx, chatID, sess, 0)
+	case session.StepLocationFilterType:
+		b.sendLocationFilterTypeQuestion(ctx, chatID, sess)
+	case session.StepOkrugSelect:
+		b.sendOkrugSelect(ctx, chatID, sess)
+	case session.StepLineSelect:
+		b.sendLineSelect(ctx, chatID, sess)
+	case session.StepStationSelect:
+		b.sendStationSelect(ctx, chatID, sess, 0)
+	case session.StepDistrictSelect:
+		b.sendDistrictSelect(ctx, chatID, sess, 0)
 	case session.StepFilterMode:
 		b.sendFilterModeQuestion(ctx, chatID, sess)
 	case session.StepScoringMode:
 		b.sendScoringModeQuestion(ctx, chatID, sess)
+	case session.StepPriorityStations:
+		b.sendPriorityStationsQuestion(ctx, chatID)
 	case session.StepMinRenovation:
 		b.sendRenovationQuestion(ctx, chatID)
 	case session.StepBathroomType:
 		b.sendBathroomQuestion(ctx, chatID)
+	case session.StepMinScore:
+		b.sendMinScoreQuestion(ctx, chatID)
 	default:
 		if meta, ok := boolFilterByStep(step); ok {
 			b.sendBoolFilterQuestion(ctx, chatID, meta)
@@ -373,7 +429,8 @@ func (b *Bot) handleAnswer(ctx context.Context, chatID int64, sess *session.Sess
 
 	switch sess.Step {
 	case session.StepDealType, session.StepReportPeriod, session.StepRegion, session.StepFilterMode,
-		session.StepScoringMode,
+		session.StepLocationFilterType, session.StepOkrugSelect, session.StepLineSelect, session.StepStationSelect,
+		session.StepDistrictSelect, session.StepScoringMode,
 		session.StepChildrenRequired, session.StepPetsRequired,
 		session.StepDishwasherRequired, session.StepConditionerRequired,
 		session.StepMinRenovation, session.StepBalconyRequired, session.StepBathroomType:
@@ -468,6 +525,22 @@ func (b *Bot) handleAnswer(ctx context.Context, chatID int64, sess *session.Sess
 		}
 		sess.MinCeilingHeight = v
 
+	case session.StepPriorityStations:
+		tokens := parseStationNames(text)
+		if len(tokens) == 0 {
+			b.send(ctx, chatID, "Пожалуйста, укажите хотя бы одну станцию.", forceReply("Например: Щёлковская, Белорусская"))
+			return
+		}
+		matched, unmatched := metro.MatchStationNames(tokens)
+		if len(matched) == 0 {
+			b.send(ctx, chatID, "Не удалось распознать ни одной станции. Проверьте названия и попробуйте снова.", forceReply("Например: Щёлковская, Белорусская"))
+			return
+		}
+		sess.PriorityStations = matched
+		if len(unmatched) > 0 {
+			b.send(ctx, chatID, "⚠️ Не распознаны как станции метро: "+strings.Join(unmatched, ", "), nil)
+		}
+
 	default:
 		return
 	}
@@ -487,6 +560,16 @@ func (b *Bot) handleCallbackQuery(ctx context.Context, cq *CallbackQuery) {
 		b.handleDealTypeCallback(ctx, chatID, cq)
 	case strings.HasPrefix(cq.Data, "pg:"), strings.HasPrefix(cq.Data, "rgn:"):
 		b.handleRegionCallback(ctx, chatID, cq)
+	case strings.HasPrefix(cq.Data, "locf:"):
+		b.handleLocationFilterTypeCallback(ctx, chatID, cq)
+	case strings.HasPrefix(cq.Data, "okr:"):
+		b.handleOkrugCallback(ctx, chatID, cq)
+	case strings.HasPrefix(cq.Data, "line:"):
+		b.handleLineCallback(ctx, chatID, cq)
+	case strings.HasPrefix(cq.Data, "stn:"):
+		b.handleStationCallback(ctx, chatID, cq)
+	case strings.HasPrefix(cq.Data, "dst:"):
+		b.handleDistrictCallback(ctx, chatID, cq)
 	case strings.HasPrefix(cq.Data, "fm:"):
 		b.handleFilterModeCallback(ctx, chatID, cq)
 	case strings.HasPrefix(cq.Data, "scmode:"):
@@ -645,7 +728,7 @@ func (b *Bot) handleRegionCallback(ctx context.Context, chatID int64, cq *Callba
 			return
 		}
 		b.answerCallback(ctx, cq.ID, "")
-		text, markup := regionPageContent(sess.Kind, page)
+		text, markup := regionPageContent(sess, page)
 		if err := b.client.EditMessageText(ctx, chatID, cq.Message.MessageID, text, markup); err != nil {
 			b.logger.Warn("edit message failed", zap.Int64("chat_id", chatID), zap.Error(err))
 		}
@@ -662,6 +745,301 @@ func (b *Bot) handleRegionCallback(ctx context.Context, chatID int64, cq *Callba
 			b.logger.Warn("edit message failed", zap.Int64("chat_id", chatID), zap.Error(err))
 		}
 		b.advance(ctx, chatID, sess, nextStep(session.StepRegion, sess))
+	}
+}
+
+// handleLocationFilterTypeCallback processes "locf:<type>" button presses,
+// the location-filter-kind step asked right after region selection. Picking
+// "okrugs", "line", "station", or "district" enters the corresponding
+// multi-select sub-step; "any" advances straight past the location filter
+// without narrowing by station.
+func (b *Bot) handleLocationFilterTypeCallback(ctx context.Context, chatID int64, cq *CallbackQuery) {
+	sess := b.sessions.Get(chatID)
+	if sess == nil || sess.Step != session.StepLocationFilterType {
+		b.answerCallback(ctx, cq.ID, "Сессия устарела. Отправьте /subscript, чтобы начать заново.")
+		return
+	}
+
+	filterType := strings.TrimPrefix(cq.Data, "locf:")
+	label, ok := locationFilterTypeLabels[filterType]
+	if !ok {
+		b.answerCallback(ctx, cq.ID, "")
+		return
+	}
+
+	sess.LocationFilterType = filterType
+	b.answerCallback(ctx, cq.ID, "")
+	if err := b.client.EditMessageText(ctx, chatID, cq.Message.MessageID, "📍 Фильтр местоположения: "+label, nil); err != nil {
+		b.logger.Warn("edit message failed", zap.Int64("chat_id", chatID), zap.Error(err))
+	}
+
+	switch filterType {
+	case session.LocationFilterOkrugs:
+		b.advance(ctx, chatID, sess, session.StepOkrugSelect)
+		return
+	case session.LocationFilterLine:
+		b.advance(ctx, chatID, sess, session.StepLineSelect)
+		return
+	case session.LocationFilterStation:
+		b.advance(ctx, chatID, sess, session.StepStationSelect)
+		return
+	case session.LocationFilterDistrict:
+		b.advance(ctx, chatID, sess, session.StepDistrictSelect)
+		return
+	}
+	b.advance(ctx, chatID, sess, nextStep(session.StepLocationFilterType, sess))
+}
+
+// handleOkrugCallback processes the okrug multi-select: "okr:<index>" toggles
+// an okrug on/off, "okr:done" finalizes the union of stations and advances.
+func (b *Bot) handleOkrugCallback(ctx context.Context, chatID int64, cq *CallbackQuery) {
+	sess := b.sessions.Get(chatID)
+	if sess == nil || sess.Step != session.StepOkrugSelect {
+		b.answerCallback(ctx, cq.ID, "Сессия устарела. Отправьте /subscript, чтобы начать заново.")
+		return
+	}
+
+	data := strings.TrimPrefix(cq.Data, "okr:")
+	if data == "done" {
+		sess.MetroStations = session.StationsForOkrugs(sess.SelectedOkrugs)
+		b.answerCallback(ctx, cq.ID, "")
+		label := "Не выбраны"
+		if len(sess.SelectedOkrugs) > 0 {
+			label = strings.Join(sess.SelectedOkrugs, ", ")
+		}
+		if err := b.client.EditMessageText(ctx, chatID, cq.Message.MessageID, "🚇 Округа: "+label, nil); err != nil {
+			b.logger.Warn("edit message failed", zap.Int64("chat_id", chatID), zap.Error(err))
+		}
+		b.advance(ctx, chatID, sess, nextStep(session.StepLocationFilterType, sess))
+		return
+	}
+
+	idx, err := strconv.Atoi(data)
+	if err != nil || idx < 0 || idx >= len(session.Okrugs) {
+		b.answerCallback(ctx, cq.ID, "")
+		return
+	}
+	name := session.Okrugs[idx].Name
+
+	toggled := false
+	for i, n := range sess.SelectedOkrugs {
+		if n == name {
+			sess.SelectedOkrugs = append(sess.SelectedOkrugs[:i], sess.SelectedOkrugs[i+1:]...)
+			toggled = true
+			break
+		}
+	}
+	if !toggled {
+		sess.SelectedOkrugs = append(sess.SelectedOkrugs, name)
+	}
+	b.sessions.Set(chatID, sess)
+
+	b.answerCallback(ctx, cq.ID, "")
+	text, markup := okrugSelectContent(sess)
+	if err := b.client.EditMessageText(ctx, chatID, cq.Message.MessageID, text, markup); err != nil {
+		b.logger.Warn("edit message failed", zap.Int64("chat_id", chatID), zap.Error(err))
+	}
+}
+
+// handleLineCallback processes the metro line multi-select: "line:<number>"
+// toggles a line on/off, "line:done" finalizes the union of stations and
+// advances.
+func (b *Bot) handleLineCallback(ctx context.Context, chatID int64, cq *CallbackQuery) {
+	sess := b.sessions.Get(chatID)
+	if sess == nil || sess.Step != session.StepLineSelect {
+		b.answerCallback(ctx, cq.ID, "Сессия устарела. Отправьте /subscript, чтобы начать заново.")
+		return
+	}
+
+	data := strings.TrimPrefix(cq.Data, "line:")
+	if data == "done" {
+		sess.MetroStations = session.StationsForLines(sess.SelectedLines)
+		b.answerCallback(ctx, cq.ID, "")
+		label := "Не выбраны"
+		if len(sess.SelectedLines) > 0 {
+			labels := make([]string, 0, len(sess.SelectedLines))
+			for _, number := range sess.SelectedLines {
+				if line, ok := session.LineByNumber(number); ok {
+					labels = append(labels, line.Label())
+				}
+			}
+			label = strings.Join(labels, ", ")
+		}
+		if err := b.client.EditMessageText(ctx, chatID, cq.Message.MessageID, "🚇 Ветки метро: "+label, nil); err != nil {
+			b.logger.Warn("edit message failed", zap.Int64("chat_id", chatID), zap.Error(err))
+		}
+		b.advance(ctx, chatID, sess, nextStep(session.StepLocationFilterType, sess))
+		return
+	}
+
+	if _, ok := session.LineByNumber(data); !ok {
+		b.answerCallback(ctx, cq.ID, "")
+		return
+	}
+
+	toggled := false
+	for i, n := range sess.SelectedLines {
+		if n == data {
+			sess.SelectedLines = append(sess.SelectedLines[:i], sess.SelectedLines[i+1:]...)
+			toggled = true
+			break
+		}
+	}
+	if !toggled {
+		sess.SelectedLines = append(sess.SelectedLines, data)
+	}
+	b.sessions.Set(chatID, sess)
+
+	b.answerCallback(ctx, cq.ID, "")
+	text, markup := lineSelectContent(sess)
+	if err := b.client.EditMessageText(ctx, chatID, cq.Message.MessageID, text, markup); err != nil {
+		b.logger.Warn("edit message failed", zap.Int64("chat_id", chatID), zap.Error(err))
+	}
+}
+
+// handleStationCallback processes the paginated station multi-select:
+// "stn:pg:<page>" switches the displayed page (keeping selections),
+// "stn:s:<index>" toggles the station at that index into session.AllStations,
+// "stn:done" finalizes the selection and advances.
+func (b *Bot) handleStationCallback(ctx context.Context, chatID int64, cq *CallbackQuery) {
+	sess := b.sessions.Get(chatID)
+	if sess == nil || sess.Step != session.StepStationSelect {
+		b.answerCallback(ctx, cq.ID, "Сессия устарела. Отправьте /subscript, чтобы начать заново.")
+		return
+	}
+
+	data := strings.TrimPrefix(cq.Data, "stn:")
+
+	if data == "done" {
+		sess.MetroStations = append([]string(nil), sess.SelectedStations...)
+		b.answerCallback(ctx, cq.ID, "")
+		label := "Не выбраны"
+		if len(sess.SelectedStations) > 0 {
+			label = strings.Join(sess.SelectedStations, ", ")
+		}
+		if err := b.client.EditMessageText(ctx, chatID, cq.Message.MessageID, "🚇 Станции метро: "+label, nil); err != nil {
+			b.logger.Warn("edit message failed", zap.Int64("chat_id", chatID), zap.Error(err))
+		}
+		b.advance(ctx, chatID, sess, nextStep(session.StepLocationFilterType, sess))
+		return
+	}
+
+	if strings.HasPrefix(data, "pg:") {
+		page, err := strconv.Atoi(strings.TrimPrefix(data, "pg:"))
+		if err != nil {
+			b.answerCallback(ctx, cq.ID, "")
+			return
+		}
+		b.answerCallback(ctx, cq.ID, "")
+		text, markup := stationSelectContent(sess, page)
+		if err := b.client.EditMessageText(ctx, chatID, cq.Message.MessageID, text, markup); err != nil {
+			b.logger.Warn("edit message failed", zap.Int64("chat_id", chatID), zap.Error(err))
+		}
+		return
+	}
+
+	if !strings.HasPrefix(data, "s:") {
+		b.answerCallback(ctx, cq.ID, "")
+		return
+	}
+	idx, err := strconv.Atoi(strings.TrimPrefix(data, "s:"))
+	if err != nil || idx < 0 || idx >= len(session.AllStations) {
+		b.answerCallback(ctx, cq.ID, "")
+		return
+	}
+	name := session.AllStations[idx]
+
+	toggled := false
+	for i, n := range sess.SelectedStations {
+		if n == name {
+			sess.SelectedStations = append(sess.SelectedStations[:i], sess.SelectedStations[i+1:]...)
+			toggled = true
+			break
+		}
+	}
+	if !toggled {
+		sess.SelectedStations = append(sess.SelectedStations, name)
+	}
+	b.sessions.Set(chatID, sess)
+
+	b.answerCallback(ctx, cq.ID, "")
+	page := idx / stationsPerPage
+	text, markup := stationSelectContent(sess, page)
+	if err := b.client.EditMessageText(ctx, chatID, cq.Message.MessageID, text, markup); err != nil {
+		b.logger.Warn("edit message failed", zap.Int64("chat_id", chatID), zap.Error(err))
+	}
+}
+
+// handleDistrictCallback processes the paginated district multi-select:
+// "dst:pg:<page>" switches the displayed page (keeping selections),
+// "dst:d:<index>" toggles the district at that index into session.Districts,
+// "dst:done" finalizes the union of stations and advances.
+func (b *Bot) handleDistrictCallback(ctx context.Context, chatID int64, cq *CallbackQuery) {
+	sess := b.sessions.Get(chatID)
+	if sess == nil || sess.Step != session.StepDistrictSelect {
+		b.answerCallback(ctx, cq.ID, "Сессия устарела. Отправьте /subscript, чтобы начать заново.")
+		return
+	}
+
+	data := strings.TrimPrefix(cq.Data, "dst:")
+
+	if data == "done" {
+		sess.MetroStations = session.StationsForDistricts(sess.SelectedDistricts)
+		b.answerCallback(ctx, cq.ID, "")
+		label := "Не выбраны"
+		if len(sess.SelectedDistricts) > 0 {
+			label = strings.Join(sess.SelectedDistricts, ", ")
+		}
+		if err := b.client.EditMessageText(ctx, chatID, cq.Message.MessageID, "🚇 Районы: "+label, nil); err != nil {
+			b.logger.Warn("edit message failed", zap.Int64("chat_id", chatID), zap.Error(err))
+		}
+		b.advance(ctx, chatID, sess, nextStep(session.StepLocationFilterType, sess))
+		return
+	}
+
+	if strings.HasPrefix(data, "pg:") {
+		page, err := strconv.Atoi(strings.TrimPrefix(data, "pg:"))
+		if err != nil {
+			b.answerCallback(ctx, cq.ID, "")
+			return
+		}
+		b.answerCallback(ctx, cq.ID, "")
+		text, markup := districtSelectContent(sess, page)
+		if err := b.client.EditMessageText(ctx, chatID, cq.Message.MessageID, text, markup); err != nil {
+			b.logger.Warn("edit message failed", zap.Int64("chat_id", chatID), zap.Error(err))
+		}
+		return
+	}
+
+	if !strings.HasPrefix(data, "d:") {
+		b.answerCallback(ctx, cq.ID, "")
+		return
+	}
+	idx, err := strconv.Atoi(strings.TrimPrefix(data, "d:"))
+	if err != nil || idx < 0 || idx >= len(session.Districts) {
+		b.answerCallback(ctx, cq.ID, "")
+		return
+	}
+	name := session.Districts[idx].Name
+
+	toggled := false
+	for i, n := range sess.SelectedDistricts {
+		if n == name {
+			sess.SelectedDistricts = append(sess.SelectedDistricts[:i], sess.SelectedDistricts[i+1:]...)
+			toggled = true
+			break
+		}
+	}
+	if !toggled {
+		sess.SelectedDistricts = append(sess.SelectedDistricts, name)
+	}
+	b.sessions.Set(chatID, sess)
+
+	b.answerCallback(ctx, cq.ID, "")
+	page := idx / districtsPerPage
+	text, markup := districtSelectContent(sess, page)
+	if err := b.client.EditMessageText(ctx, chatID, cq.Message.MessageID, text, markup); err != nil {
+		b.logger.Warn("edit message failed", zap.Int64("chat_id", chatID), zap.Error(err))
 	}
 }
 
@@ -701,7 +1079,11 @@ func (b *Bot) handleScoringModeCallback(ctx context.Context, chatID int64, cq *C
 	}
 
 	mode := strings.TrimPrefix(cq.Data, "scmode:")
-	if mode != session.ScoringModeDefault && mode != session.ScoringModeCustom {
+	if mode != session.ScoringModeDefault && mode != session.ScoringModeCustom && mode != session.ScoringModePriority {
+		b.answerCallback(ctx, cq.ID, "")
+		return
+	}
+	if mode == session.ScoringModePriority && sess.Region != moscowRegionID {
 		b.answerCallback(ctx, cq.ID, "")
 		return
 	}
@@ -709,8 +1091,11 @@ func (b *Bot) handleScoringModeCallback(ctx context.Context, chatID int64, cq *C
 	sess.ScoringMode = mode
 	b.answerCallback(ctx, cq.ID, "")
 	label := "Скоринг по умолчанию"
-	if mode == session.ScoringModeCustom {
+	switch mode {
+	case session.ScoringModeCustom:
 		label = "Свои параметры скоринга"
+	case session.ScoringModePriority:
+		label = "Приоритетные станции"
 	}
 	if err := b.client.EditMessageText(ctx, chatID, cq.Message.MessageID, "🎯 "+label, nil); err != nil {
 		b.logger.Warn("edit message failed", zap.Int64("chat_id", chatID), zap.Error(err))
@@ -849,7 +1234,8 @@ func (b *Bot) sendDealTypeQuestion(ctx context.Context, chatID int64, kind strin
 		{{Text: "🏠 Аренда", CallbackData: "deal:" + session.DealTypeRent}},
 		{{Text: "💰 Продажа", CallbackData: "deal:" + session.DealTypeSale}},
 	}}
-	text := fmt.Sprintf("Шаг %d/%d — Что вас интересует?", stepNumber(session.StepDealType, kind), totalSteps(kind))
+	sess := &session.Session{Kind: kind}
+	text := fmt.Sprintf("Шаг %d/%d — Что вас интересует?", stepNumber(session.StepDealType, sess), totalSteps(sess))
 	b.send(ctx, chatID, text, markup)
 }
 
@@ -862,19 +1248,19 @@ func (b *Bot) sendReportPeriodQuestion(ctx context.Context, chatID int64, sess *
 		})
 	}
 	text := fmt.Sprintf("Шаг %d/%d — Как часто присылать отчёт?",
-		stepNumber(session.StepReportPeriod, sess.Kind), totalSteps(sess.Kind))
+		stepNumber(session.StepReportPeriod, sess), totalSteps(sess))
 	b.send(ctx, chatID, text, &InlineKeyboardMarkup{InlineKeyboard: rows})
 }
 
 // sendRegionPage sends a new message showing the region selector at the given page.
 func (b *Bot) sendRegionPage(ctx context.Context, chatID int64, sess *session.Session, page int) {
-	text, markup := regionPageContent(sess.Kind, page)
+	text, markup := regionPageContent(sess, page)
 	b.send(ctx, chatID, text, markup)
 }
 
 // regionPageContent renders the region selector text and inline keyboard for
 // a 0-indexed page of session.Regions.
-func regionPageContent(kind string, page int) (string, *InlineKeyboardMarkup) {
+func regionPageContent(sess *session.Session, page int) (string, *InlineKeyboardMarkup) {
 	totalPages := (len(session.Regions) + regionsPerPage - 1) / regionsPerPage
 	if page < 0 {
 		page = 0
@@ -908,8 +1294,215 @@ func regionPageContent(kind string, page int) (string, *InlineKeyboardMarkup) {
 	}
 
 	text := fmt.Sprintf("Шаг %d/%d — Выберите регион (страница %d/%d):",
-		stepNumber(session.StepRegion, kind), totalSteps(kind), page+1, totalPages)
+		stepNumber(session.StepRegion, sess), totalSteps(sess), page+1, totalPages)
 	return text, &InlineKeyboardMarkup{InlineKeyboard: rows}
+}
+
+// sendLocationFilterTypeQuestion asks which kind of metro-based location
+// filter (if any) the user wants to narrow their search by.
+func (b *Bot) sendLocationFilterTypeQuestion(ctx context.Context, chatID int64, sess *session.Session) {
+	markup := &InlineKeyboardMarkup{InlineKeyboard: [][]InlineKeyboardButton{
+		{{Text: "Округа", CallbackData: "locf:" + session.LocationFilterOkrugs}},
+		{{Text: "Районы", CallbackData: "locf:" + session.LocationFilterDistrict}},
+		{{Text: "Станции метро", CallbackData: "locf:" + session.LocationFilterStation}},
+		{{Text: "Ветки метро", CallbackData: "locf:" + session.LocationFilterLine}},
+		{{Text: "Не важно", CallbackData: "locf:" + session.LocationFilterAny}},
+	}}
+	text := fmt.Sprintf("Шаг %d/%d — Какой фильтр местоположения вас интересует?",
+		stepNumber(session.StepLocationFilterType, sess), totalSteps(sess))
+	b.send(ctx, chatID, text, markup)
+}
+
+// locationFilterTypeLabels maps a stored LocationFilterType to its
+// human-readable Russian label.
+var locationFilterTypeLabels = map[string]string{
+	session.LocationFilterOkrugs:   "Округа",
+	session.LocationFilterDistrict: "Районы",
+	session.LocationFilterStation:  "Станции метро",
+	session.LocationFilterLine:     "Ветки метро",
+	session.LocationFilterAny:      "Не важно",
+}
+
+// okrugSelectContent renders the multi-select okrug keyboard, marking
+// currently selected okrugs with a checkmark.
+func okrugSelectContent(sess *session.Session) (string, *InlineKeyboardMarkup) {
+	selected := make(map[string]bool, len(sess.SelectedOkrugs))
+	for _, name := range sess.SelectedOkrugs {
+		selected[name] = true
+	}
+
+	rows := make([][]InlineKeyboardButton, 0, len(session.Okrugs)+1)
+	for i, o := range session.Okrugs {
+		label := o.Name
+		if selected[o.Name] {
+			label = "✅ " + label
+		}
+		rows = append(rows, []InlineKeyboardButton{
+			{Text: label, CallbackData: fmt.Sprintf("okr:%d", i)},
+		})
+	}
+	rows = append(rows, []InlineKeyboardButton{{Text: "Готово ▶", CallbackData: "okr:done"}})
+
+	text := "🚇 Выберите один или несколько округов (можно отметить несколько), затем нажмите «Готово».\n\n" +
+		"Квартира подойдёт, если хотя бы одна из её станций метро относится к выбранным округам."
+	return text, &InlineKeyboardMarkup{InlineKeyboard: rows}
+}
+
+// sendOkrugSelect sends a new message with the okrug multi-select keyboard.
+func (b *Bot) sendOkrugSelect(ctx context.Context, chatID int64, sess *session.Session) {
+	text, markup := okrugSelectContent(sess)
+	b.send(ctx, chatID, text, markup)
+}
+
+// lineSelectContent renders the multi-select metro line keyboard, marking
+// currently selected lines with a checkmark. Each button shows the line's
+// emoji (if any), name, and number/code in parentheses.
+func lineSelectContent(sess *session.Session) (string, *InlineKeyboardMarkup) {
+	selected := make(map[string]bool, len(sess.SelectedLines))
+	for _, number := range sess.SelectedLines {
+		selected[number] = true
+	}
+
+	rows := make([][]InlineKeyboardButton, 0, len(session.Lines)+1)
+	for _, l := range session.Lines {
+		label := l.Label()
+		if selected[l.Number] {
+			label = "✅ " + label
+		}
+		rows = append(rows, []InlineKeyboardButton{
+			{Text: label, CallbackData: "line:" + l.Number},
+		})
+	}
+	rows = append(rows, []InlineKeyboardButton{{Text: "Готово ▶", CallbackData: "line:done"}})
+
+	text := "🚇 Выберите одну или несколько веток метро (можно отметить несколько), затем нажмите «Готово».\n\n" +
+		"Квартира подойдёт, если хотя бы одна из её станций метро относится к выбранным веткам."
+	return text, &InlineKeyboardMarkup{InlineKeyboard: rows}
+}
+
+// sendLineSelect sends a new message with the metro line multi-select keyboard.
+func (b *Bot) sendLineSelect(ctx context.Context, chatID int64, sess *session.Session) {
+	text, markup := lineSelectContent(sess)
+	b.send(ctx, chatID, text, markup)
+}
+
+// stationSelectContent renders one page (stationsPerPage stations, in
+// session.AllStations' alphabetical order) of the multi-select station
+// keyboard, marking currently selected stations with a checkmark and adding
+// pagination and a "Готово" row.
+func stationSelectContent(sess *session.Session, page int) (string, *InlineKeyboardMarkup) {
+	totalPages := (len(session.AllStations) + stationsPerPage - 1) / stationsPerPage
+	if page < 0 {
+		page = 0
+	}
+	if page > totalPages-1 {
+		page = totalPages - 1
+	}
+
+	start := page * stationsPerPage
+	end := start + stationsPerPage
+	if end > len(session.AllStations) {
+		end = len(session.AllStations)
+	}
+
+	selected := make(map[string]bool, len(sess.SelectedStations))
+	for _, name := range sess.SelectedStations {
+		selected[name] = true
+	}
+
+	rows := make([][]InlineKeyboardButton, 0, stationsPerPage+2)
+	for i := start; i < end; i++ {
+		name := session.AllStations[i]
+		label := name
+		if selected[name] {
+			label = "✅ " + label
+		}
+		rows = append(rows, []InlineKeyboardButton{
+			{Text: label, CallbackData: fmt.Sprintf("stn:s:%d", i)},
+		})
+	}
+
+	var navRow []InlineKeyboardButton
+	if page > 0 {
+		navRow = append(navRow, InlineKeyboardButton{Text: "◀ Назад", CallbackData: fmt.Sprintf("stn:pg:%d", page-1)})
+	}
+	if page < totalPages-1 {
+		navRow = append(navRow, InlineKeyboardButton{Text: "Далее ▶", CallbackData: fmt.Sprintf("stn:pg:%d", page+1)})
+	}
+	if len(navRow) > 0 {
+		rows = append(rows, navRow)
+	}
+	rows = append(rows, []InlineKeyboardButton{{Text: "Готово ▶", CallbackData: "stn:done"}})
+
+	text := fmt.Sprintf("🚇 Выберите одну или несколько станций метро (страница %d/%d), затем нажмите «Готово».\n\n"+
+		"Квартира подойдёт, если хотя бы одна из её станций метро совпадёт с выбранными.",
+		page+1, totalPages)
+	return text, &InlineKeyboardMarkup{InlineKeyboard: rows}
+}
+
+// sendStationSelect sends a new message with the station multi-select keyboard.
+func (b *Bot) sendStationSelect(ctx context.Context, chatID int64, sess *session.Session, page int) {
+	text, markup := stationSelectContent(sess, page)
+	b.send(ctx, chatID, text, markup)
+}
+
+// districtSelectContent renders one page (districtsPerPage districts) of the
+// multi-select district keyboard, marking currently selected districts with
+// a checkmark and adding pagination and a "Готово" row.
+func districtSelectContent(sess *session.Session, page int) (string, *InlineKeyboardMarkup) {
+	totalPages := (len(session.Districts) + districtsPerPage - 1) / districtsPerPage
+	if page < 0 {
+		page = 0
+	}
+	if page > totalPages-1 {
+		page = totalPages - 1
+	}
+
+	start := page * districtsPerPage
+	end := start + districtsPerPage
+	if end > len(session.Districts) {
+		end = len(session.Districts)
+	}
+
+	selected := make(map[string]bool, len(sess.SelectedDistricts))
+	for _, name := range sess.SelectedDistricts {
+		selected[name] = true
+	}
+
+	rows := make([][]InlineKeyboardButton, 0, districtsPerPage+2)
+	for i := start; i < end; i++ {
+		d := session.Districts[i]
+		label := d.Name
+		if selected[d.Name] {
+			label = "✅ " + label
+		}
+		rows = append(rows, []InlineKeyboardButton{
+			{Text: label, CallbackData: fmt.Sprintf("dst:d:%d", i)},
+		})
+	}
+
+	var navRow []InlineKeyboardButton
+	if page > 0 {
+		navRow = append(navRow, InlineKeyboardButton{Text: "◀ Назад", CallbackData: fmt.Sprintf("dst:pg:%d", page-1)})
+	}
+	if page < totalPages-1 {
+		navRow = append(navRow, InlineKeyboardButton{Text: "Далее ▶", CallbackData: fmt.Sprintf("dst:pg:%d", page+1)})
+	}
+	if len(navRow) > 0 {
+		rows = append(rows, navRow)
+	}
+	rows = append(rows, []InlineKeyboardButton{{Text: "Готово ▶", CallbackData: "dst:done"}})
+
+	text := fmt.Sprintf("🚇 Выберите один или несколько районов (страница %d/%d), затем нажмите «Готово».\n\n"+
+		"Квартира подойдёт, если хотя бы одна из её станций метро относится к выбранным районам.",
+		page+1, totalPages)
+	return text, &InlineKeyboardMarkup{InlineKeyboard: rows}
+}
+
+// sendDistrictSelect sends a new message with the district multi-select keyboard.
+func (b *Bot) sendDistrictSelect(ctx context.Context, chatID int64, sess *session.Session, page int) {
+	text, markup := districtSelectContent(sess, page)
+	b.send(ctx, chatID, text, markup)
 }
 
 // sendFilterModeQuestion asks whether to use basic or extended filters.
@@ -921,7 +1514,7 @@ func (b *Bot) sendFilterModeQuestion(ctx context.Context, chatID int64, sess *se
 	text := fmt.Sprintf("Шаг %d/%d — Какие фильтры настроить?\n\n"+
 		"Базовые — цена, площадь, комнаты, мин. скор.\n"+
 		"Расширенные — те же фильтры плюс доп. параметры (метро, этаж, ремонт и т.д.).",
-		stepNumber(session.StepFilterMode, sess.Kind), totalSteps(sess.Kind))
+		stepNumber(session.StepFilterMode, sess), totalSteps(sess))
 	b.send(ctx, chatID, text, markup)
 }
 
@@ -929,15 +1522,22 @@ func (b *Bot) sendFilterModeQuestion(ctx context.Context, chatID int64, sess *se
 // weighted formula, right before the min-score question. Only reachable for
 // KindSubscription — report subscriptions always use default scoring.
 func (b *Bot) sendScoringModeQuestion(ctx context.Context, chatID int64, sess *session.Session) {
-	markup := &InlineKeyboardMarkup{InlineKeyboard: [][]InlineKeyboardButton{
+	rows := [][]InlineKeyboardButton{
 		{{Text: "Скоринг по умолчанию", CallbackData: "scmode:" + session.ScoringModeDefault}},
 		{{Text: "Настроить параметры скоринга", CallbackData: "scmode:" + session.ScoringModeCustom}},
-	}}
-	text := fmt.Sprintf("Шаг %d/%d — Как рассчитывать скор квартиры?\n\n"+
-		"По умолчанию — стандартная формула.\n"+
-		"Свои параметры — вы укажете, сколько готовы платить за каждый критерий (20 вопросов).",
-		stepNumber(session.StepScoringMode, sess.Kind), totalSteps(sess.Kind))
-	b.send(ctx, chatID, text, markup)
+	}
+	body := "По умолчанию — стандартная формула.\n" +
+		"Свои параметры — вы укажете, сколько готовы платить за каждый критерий (20 вопросов)."
+	if sess.Region == moscowRegionID {
+		rows = append(rows, []InlineKeyboardButton{
+			{Text: "Уточнить приоритетные станции", CallbackData: "scmode:" + session.ScoringModePriority},
+		})
+		body += "\nУточнить приоритетные станции — стандартная формула, но вы назовёте станции метро, " +
+			"которые вам важны, и увидите пересчитанный топ-10 станций с учётом этого."
+	}
+	text := fmt.Sprintf("Шаг %d/%d — Как рассчитывать скор квартиры?\n\n%s",
+		stepNumber(session.StepScoringMode, sess), totalSteps(sess), body)
+	b.send(ctx, chatID, text, &InlineKeyboardMarkup{InlineKeyboard: rows})
 }
 
 // scoringQuestionPrefix builds the "Сколько вы готовы ...за" lead-in, which
@@ -962,6 +1562,23 @@ func (b *Bot) sendScoringQuestion(ctx context.Context, chatID int64, sess *sessi
 	fmt.Fprintf(&sb, "По умолчанию: %s ₽", fmtFloatOrAny(def))
 
 	b.send(ctx, chatID, sb.String(), forceReply("Введите число или 0..."))
+}
+
+// sendMinScoreQuestion asks for the minimum acceptable flat score, the last
+// custom-scoring question — only reachable when the user opted into custom
+// scoring; the default formula skips it entirely.
+func (b *Bot) sendMinScoreQuestion(ctx context.Context, chatID int64) {
+	text := fmt.Sprintf("Скоринг %d/%d — Минимальный скор квартиры?\n\nВведите число или 0, чтобы не ограничивать.",
+		len(session.ScoringSteps), len(session.ScoringSteps))
+	b.send(ctx, chatID, text, forceReply("Введите число..."))
+}
+
+// sendPriorityStationsQuestion asks for the priority station names, the
+// single question in the ScoringModePriority flow.
+func (b *Bot) sendPriorityStationsQuestion(ctx context.Context, chatID int64) {
+	b.send(ctx, chatID,
+		"Укажите названия приоритетных станций через пробел или запятую.",
+		forceReply("Например: Щёлковская, Белорусская"))
 }
 
 // sendBoolFilterQuestion sends an "обязательно"/"не обязательно" choice for
@@ -999,14 +1616,16 @@ func (b *Bot) sendBathroomQuestion(ctx context.Context, chatID int64) {
 
 func (b *Bot) finalize(ctx context.Context, chatID int64, sess *session.Session) {
 	sub := db.Subscription{
-		DealType: sess.DealType,
-		Region:   sess.Region,
-		MinPrice: sess.MinPrice,
-		MaxPrice: sess.MaxPrice,
-		MinArea:  sess.MinArea,
-		MaxArea:  sess.MaxArea,
-		Rooms:    sess.Rooms,
-		MinScore: sess.MinScore,
+		DealType:         sess.DealType,
+		Region:           sess.Region,
+		MetroStations:    sess.MetroStations,
+		MetroFilterLabel: locationFilterLabel(sess),
+		MinPrice:         sess.MinPrice,
+		MaxPrice:         sess.MaxPrice,
+		MinArea:          sess.MinArea,
+		MaxArea:          sess.MaxArea,
+		Rooms:            sess.Rooms,
+		MinScore:         sess.MinScore,
 
 		MinUndergroundPlace: sess.MinUndergroundPlace,
 		MinKitchenArea:      sess.MinKitchenArea,
@@ -1020,6 +1639,7 @@ func (b *Bot) finalize(ctx context.Context, chatID int64, sess *session.Session)
 		MinRenovation:       sess.MinRenovation,
 		BalconyRequired:     sess.BalconyRequired,
 		BathroomType:        sess.BathroomType,
+		PriorityStations:    sess.PriorityStations,
 	}
 	if sess.ScoringMode == session.ScoringModeCustom {
 		p := sess.ScoringParams
@@ -1076,11 +1696,28 @@ func (b *Bot) finalize(ctx context.Context, chatID int64, sess *session.Session)
 
 	summary := formatSubscriptionSummary(sub)
 	b.send(ctx, chatID, "✅ Подписка успешно создана!\n\n"+summary, &ReplyKeyboardRemove{RemoveKeyboard: true})
+
+	if sess.ScoringMode == session.ScoringModePriority && len(sess.PriorityStations) > 0 {
+		b.send(ctx, chatID, priorityTopStationsMessage(sess.PriorityStations), nil)
+	}
+}
+
+// priorityTopStationsMessage renders the top-10 re-ranked stations after
+// boosting priorityStations, shown once right after a subscription with
+// ScoringModePriority is created.
+func priorityTopStationsMessage(priorityStations []string) string {
+	top := metro.TopStations(priorityStations, 10)
+	var sb strings.Builder
+	sb.WriteString("топ-10 станций с учетом Ваших приоритетов:\n")
+	for _, s := range top {
+		fmt.Fprintf(&sb, "%s: %.2f\n", s.Name, s.Score)
+	}
+	return strings.TrimRight(sb.String(), "\n")
 }
 
 func (b *Bot) sendQuestion(ctx context.Context, chatID int64, sess *session.Session, step session.Step) {
 	if body, ok := stepQuestionBody[step]; ok {
-		text := fmt.Sprintf("Шаг %d/%d — %s", stepNumber(step, sess.Kind), totalSteps(sess.Kind), body)
+		text := fmt.Sprintf("Шаг %d/%d — %s", stepNumber(step, sess), totalSteps(sess), body)
 		b.send(ctx, chatID, text, forceReply("Введите ответ..."))
 		return
 	}
@@ -1118,6 +1755,29 @@ func parseFloat(s string) (float64, error) {
 	return v, nil
 }
 
+// parseStationNames splits free-text station names on commas/semicolons if
+// present (so multi-word names like "Парк Победы" survive intact), or on
+// whitespace otherwise (space-separated single-word names).
+func parseStationNames(s string) []string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return nil
+	}
+	var parts []string
+	if strings.ContainsAny(s, ",;") {
+		parts = strings.FieldsFunc(s, func(r rune) bool { return r == ',' || r == ';' })
+	} else {
+		parts = strings.Fields(s)
+	}
+	names := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if p = strings.TrimSpace(p); p != "" {
+			names = append(names, p)
+		}
+	}
+	return names
+}
+
 func parseRooms(s string) ([]int32, error) {
 	s = strings.TrimSpace(s)
 	// Treat "0" as "no filter"
@@ -1143,6 +1803,44 @@ func parseRooms(s string) ([]int32, error) {
 	return rooms, nil
 }
 
+// locationFilterLabel renders a human-readable description of the metro
+// filter the user picked (which okrugs/lines/districts/stations, not just
+// the resulting station list), for storage alongside the subscription so
+// summaries and the /cancel selector can describe it later. Empty if no
+// metro filter was set.
+func locationFilterLabel(sess *session.Session) string {
+	switch sess.LocationFilterType {
+	case session.LocationFilterOkrugs:
+		if len(sess.SelectedOkrugs) == 0 {
+			return ""
+		}
+		return "Округа: " + strings.Join(sess.SelectedOkrugs, ", ")
+	case session.LocationFilterLine:
+		if len(sess.SelectedLines) == 0 {
+			return ""
+		}
+		labels := make([]string, 0, len(sess.SelectedLines))
+		for _, number := range sess.SelectedLines {
+			if line, ok := session.LineByNumber(number); ok {
+				labels = append(labels, line.Label())
+			}
+		}
+		return "Ветки метро: " + strings.Join(labels, ", ")
+	case session.LocationFilterDistrict:
+		if len(sess.SelectedDistricts) == 0 {
+			return ""
+		}
+		return "Районы: " + strings.Join(sess.SelectedDistricts, ", ")
+	case session.LocationFilterStation:
+		if len(sess.SelectedStations) == 0 {
+			return ""
+		}
+		return "Станции метро: " + strings.Join(sess.SelectedStations, ", ")
+	default:
+		return ""
+	}
+}
+
 func formatSubscriptionSummary(sub db.Subscription) string {
 	var sb strings.Builder
 	sb.WriteString("🏷 " + dealTypeLabel(sub.DealType) + "\n")
@@ -1164,11 +1862,20 @@ func formatSubscriptionSummary(sub db.Subscription) string {
 		}
 		sb.WriteString("🚪 Комнат: " + strings.Join(parts, ", ") + "\n")
 	}
+	if sub.MetroFilterLabel != "" {
+		sb.WriteString("🚇 " + sub.MetroFilterLabel + "\n")
+	} else if len(sub.MetroStations) > 0 {
+		// Fallback for subscriptions created before metro_filter_label existed.
+		sb.WriteString("🚇 Станции метро: " + strings.Join(sub.MetroStations, ", ") + "\n")
+	}
 	if sub.MinScore > 0 {
 		sb.WriteString(fmt.Sprintf("⭐ Мин. скор: %d\n", sub.MinScore))
 	}
 	if sub.ScoringParams != nil {
 		sb.WriteString("🎯 Скоринг: свои параметры\n")
+	}
+	if len(sub.PriorityStations) > 0 {
+		sb.WriteString("🎯 Приоритетные станции: " + strings.Join(sub.PriorityStations, ", ") + "\n")
 	}
 
 	if sub.MinUndergroundPlace > 0 {
@@ -1211,6 +1918,61 @@ func formatSubscriptionSummary(sub db.Subscription) string {
 	return sb.String()
 }
 
+// briefMetroLabel truncates a MetroFilterLabel for use in a one-line brief,
+// so a long list of selected stations doesn't blow out the button text.
+func briefMetroLabel(label string) string {
+	const maxLen = 40
+	if label == "" || utf8.RuneCountInString(label) <= maxLen {
+		return label
+	}
+	runes := []rune(label)
+	return string(runes[:maxLen]) + "…"
+}
+
+// extendedFilterTags renders short tags for whichever extended filters are
+// set, shared by subscriptionBrief and reportSubscriptionBrief.
+func extendedFilterTags(
+	minUndergroundPlace int, minKitchenArea float64, minFloor, maxFloor int, minCeilingHeight float64,
+	childrenRequired, petsRequired, dishwasherRequired, conditionerRequired bool,
+	minRenovation string, balconyRequired bool, bathroomType string,
+) []string {
+	var tags []string
+	if minUndergroundPlace > 0 {
+		tags = append(tags, fmt.Sprintf("метро≥%d", minUndergroundPlace))
+	}
+	if minKitchenArea > 0 {
+		tags = append(tags, fmt.Sprintf("кухня≥%sм²", fmtFloatOrAny(minKitchenArea)))
+	}
+	if minFloor > 0 || maxFloor > 0 {
+		tags = append(tags, fmt.Sprintf("этаж %s-%s", fmtOrAny(minFloor), fmtOrAny(maxFloor)))
+	}
+	if minCeilingHeight > 0 {
+		tags = append(tags, fmt.Sprintf("потолки≥%sм", fmtFloatOrAny(minCeilingHeight)))
+	}
+	if childrenRequired {
+		tags = append(tags, "дети")
+	}
+	if petsRequired {
+		tags = append(tags, "животные")
+	}
+	if dishwasherRequired {
+		tags = append(tags, "посудомойка")
+	}
+	if conditionerRequired {
+		tags = append(tags, "кондиционер")
+	}
+	if minRenovation != "" {
+		tags = append(tags, "ремонт:"+renovationLabels[minRenovation])
+	}
+	if balconyRequired {
+		tags = append(tags, "балкон")
+	}
+	if bathroomType != "" {
+		tags = append(tags, "с/у:"+bathroomLabels[bathroomType])
+	}
+	return tags
+}
+
 // subscriptionBrief renders a short one-line summary of a subscription for
 // use as an inline-keyboard button label in the /cancel selector.
 func subscriptionBrief(sub db.Subscription) string {
@@ -1229,6 +1991,14 @@ func subscriptionBrief(sub db.Subscription) string {
 	if sub.MinScore > 0 {
 		parts = append(parts, fmt.Sprintf("скор≥%d", sub.MinScore))
 	}
+	if label := briefMetroLabel(sub.MetroFilterLabel); label != "" {
+		parts = append(parts, label)
+	}
+	parts = append(parts, extendedFilterTags(
+		sub.MinUndergroundPlace, sub.MinKitchenArea, sub.MinFloor, sub.MaxFloor, sub.MinCeilingHeight,
+		sub.ChildrenRequired, sub.PetsRequired, sub.DishwasherRequired, sub.ConditionerRequired,
+		sub.MinRenovation, sub.BalconyRequired, sub.BathroomType,
+	)...)
 
 	return strings.Join(parts, ", ")
 }
@@ -1249,6 +2019,14 @@ func reportSubscriptionBrief(sub db.ReportSubscription) string {
 		}
 		parts = append(parts, strings.Join(roomParts, ",")+"к")
 	}
+	if label := briefMetroLabel(sub.MetroFilterLabel); label != "" {
+		parts = append(parts, label)
+	}
+	parts = append(parts, extendedFilterTags(
+		sub.MinUndergroundPlace, sub.MinKitchenArea, sub.MinFloor, sub.MaxFloor, sub.MinCeilingHeight,
+		sub.ChildrenRequired, sub.PetsRequired, sub.DishwasherRequired, sub.ConditionerRequired,
+		sub.MinRenovation, sub.BalconyRequired, sub.BathroomType,
+	)...)
 
 	return strings.Join(parts, ", ")
 }

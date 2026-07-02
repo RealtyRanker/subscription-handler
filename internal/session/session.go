@@ -12,6 +12,11 @@ const (
 	StepDealType
 	StepReportPeriod
 	StepRegion
+	StepLocationFilterType
+	StepOkrugSelect
+	StepLineSelect
+	StepStationSelect
+	StepDistrictSelect
 	StepFilterMode
 	StepMinPrice
 	StepMaxPrice
@@ -19,6 +24,7 @@ const (
 	StepMaxArea
 	StepRooms
 	StepScoringMode
+	StepPriorityStations
 	StepScoreAllArea
 	StepScoreKitchenArea
 	StepScorePets
@@ -100,6 +106,18 @@ const (
 	FilterModeExtended = "extended"
 )
 
+// Location filter types offered right after region selection: which kind of
+// metro-based breakdown (if any) the user wants to narrow their search by.
+// Only LocationFilterOkrugs is currently wired up to an actual station set;
+// the others behave like LocationFilterAny until implemented.
+const (
+	LocationFilterOkrugs   = "okrugs"
+	LocationFilterDistrict = "district"
+	LocationFilterStation  = "station"
+	LocationFilterLine     = "line"
+	LocationFilterAny      = "any"
+)
+
 // Renovation levels stored in user_subscriptions.min_renovation, ranked
 // design > euro > cosmetic > "" (не важно / no renovation info).
 const (
@@ -116,14 +134,20 @@ const (
 	BathroomAny       = ""
 )
 
-// Scoring modes offered right before the min-score question.
+// Scoring modes offered right before the min-score question. ScoringModePriority
+// is only offered for Moscow (region 1) subscriptions; it behaves like the
+// default formula for matching purposes, but lets the user name priority
+// stations whose neighborhood gets boosted in a one-off top-10 preview.
 const (
-	ScoringModeDefault = "default"
-	ScoringModeCustom  = "custom"
+	ScoringModeDefault  = "default"
+	ScoringModeCustom   = "custom"
+	ScoringModePriority = "priority"
 )
 
 // ScoringSteps lists the custom-scoring questions in order, used both for
 // step transitions and for their own separate "Скоринг i/N" numbering.
+// StepMinScore is appended last: it's only asked when the user opts into
+// custom scoring, and skipped entirely for the default formula.
 var ScoringSteps = []Step{
 	StepScoreAllArea,
 	StepScoreKitchenArea,
@@ -145,6 +169,7 @@ var ScoringSteps = []Step{
 	StepScoreBalcony,
 	StepScoreLoggia,
 	StepScoreUnderground,
+	StepMinScore,
 }
 
 // ScoringParams holds the 18 customizable scoring multipliers a user can
@@ -180,6 +205,12 @@ type Session struct {
 	DealType            string
 	ReportPeriodSeconds int
 	Region              int
+	LocationFilterType  string
+	SelectedOkrugs      []string // okrug names currently toggled on in StepOkrugSelect
+	SelectedLines       []string // line numbers currently toggled on in StepLineSelect
+	SelectedStations    []string // station names currently toggled on in StepStationSelect
+	SelectedDistricts   []string // district names currently toggled on in StepDistrictSelect
+	MetroStations       []string // union of stations for the chosen location filter
 	FilterMode          string
 
 	MinPrice int
@@ -188,8 +219,9 @@ type Session struct {
 	MaxArea  float64
 	Rooms    []int32
 
-	ScoringMode   string
-	ScoringParams ScoringParams
+	ScoringMode      string
+	ScoringParams    ScoringParams
+	PriorityStations []string // canonical station names, set when ScoringMode == ScoringModePriority
 
 	MinScore int
 
