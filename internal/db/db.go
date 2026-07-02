@@ -41,7 +41,15 @@ type Subscription struct {
 	// PriorityStations holds the canonical station names named when the
 	// subscriber chose the "priority stations" scoring option (report
 	// subscriptions never set this — always empty for them).
-	PriorityStations []string
+	//
+	// PriorityStationNames/PriorityStationScores hold the full priority-boosted
+	// station ranking computed once at creation time (best-first, i.e. index 0
+	// is place 1; scores already normalized by dividing by the station count),
+	// so flats-analyzer can look a flat's station place up directly instead of
+	// recomputing the ranking algorithm for every flat.
+	PriorityStations      []string
+	PriorityStationNames  []string
+	PriorityStationScores []float64
 }
 
 // ScoringParams holds the 18 customizable scoring multipliers a subscriber
@@ -151,6 +159,14 @@ func (db *DB) CreateSubscription(ctx context.Context, chatID int64, sub Subscrip
 	if priorityStations == nil {
 		priorityStations = []string{}
 	}
+	priorityStationNames := sub.PriorityStationNames
+	if priorityStationNames == nil {
+		priorityStationNames = []string{}
+	}
+	priorityStationScores := sub.PriorityStationScores
+	if priorityStationScores == nil {
+		priorityStationScores = []float64{}
+	}
 
 	tx, err := db.pool.Begin(ctx)
 	if err != nil {
@@ -165,18 +181,18 @@ func (db *DB) CreateSubscription(ctx context.Context, chatID int64, sub Subscrip
 		    min_underground_place, min_kitchen_area, min_floor, max_floor, min_ceiling_height,
 		    children_required, pets_required, dishwasher_required, conditioner_required,
 		    min_renovation, balcony_required, bathroom_type, metro_stations, metro_filter_label,
-		    priority_stations, is_active)
+		    priority_stations, priority_station_names, priority_station_scores, is_active)
 		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9,
 		         $10, $11, $12, $13, $14,
 		         $15, $16, $17, $18,
-		         $19, $20, $21, $22, $23, $24, TRUE)
+		         $19, $20, $21, $22, $23, $24, $25, $26, TRUE)
 		 RETURNING id`,
 		chatID, sub.DealType, sub.Region, sub.MinPrice, sub.MaxPrice,
 		sub.MinArea, sub.MaxArea, rooms, sub.MinScore,
 		sub.MinUndergroundPlace, sub.MinKitchenArea, sub.MinFloor, sub.MaxFloor, sub.MinCeilingHeight,
 		sub.ChildrenRequired, sub.PetsRequired, sub.DishwasherRequired, sub.ConditionerRequired,
 		sub.MinRenovation, sub.BalconyRequired, sub.BathroomType, metroStations, sub.MetroFilterLabel,
-		priorityStations,
+		priorityStations, priorityStationNames, priorityStationScores,
 	).Scan(&subscriptionID)
 	if err != nil {
 		return fmt.Errorf("inserting subscription: %w", err)

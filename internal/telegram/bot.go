@@ -1615,6 +1615,21 @@ func (b *Bot) sendBathroomQuestion(ctx context.Context, chatID int64) {
 }
 
 func (b *Bot) finalize(ctx context.Context, chatID int64, sess *session.Session) {
+	// Compute the priority-boosted station ranking once, here, so it can be
+	// both persisted (for flats-analyzer to look up per-flat places without
+	// recomputing) and reused for the top-10 preview below.
+	var priorityStationNames []string
+	var priorityStationScores []float64
+	if sess.ScoringMode == session.ScoringModePriority && len(sess.PriorityStations) > 0 {
+		ranking := metro.TopStations(sess.PriorityStations, metro.NumStations)
+		priorityStationNames = make([]string, len(ranking))
+		priorityStationScores = make([]float64, len(ranking))
+		for i, r := range ranking {
+			priorityStationNames[i] = r.Name
+			priorityStationScores[i] = r.Score / float64(metro.NumStations)
+		}
+	}
+
 	sub := db.Subscription{
 		DealType:         sess.DealType,
 		Region:           sess.Region,
@@ -1639,7 +1654,10 @@ func (b *Bot) finalize(ctx context.Context, chatID int64, sess *session.Session)
 		MinRenovation:       sess.MinRenovation,
 		BalconyRequired:     sess.BalconyRequired,
 		BathroomType:        sess.BathroomType,
-		PriorityStations:    sess.PriorityStations,
+
+		PriorityStations:      sess.PriorityStations,
+		PriorityStationNames:  priorityStationNames,
+		PriorityStationScores: priorityStationScores,
 	}
 	if sess.ScoringMode == session.ScoringModeCustom {
 		p := sess.ScoringParams
@@ -1697,20 +1715,24 @@ func (b *Bot) finalize(ctx context.Context, chatID int64, sess *session.Session)
 	summary := formatSubscriptionSummary(sub)
 	b.send(ctx, chatID, "✅ Подписка успешно создана!\n\n"+summary, &ReplyKeyboardRemove{RemoveKeyboard: true})
 
-	if sess.ScoringMode == session.ScoringModePriority && len(sess.PriorityStations) > 0 {
-		b.send(ctx, chatID, priorityTopStationsMessage(sess.PriorityStations), nil)
+	if len(priorityStationNames) > 0 {
+		b.send(ctx, chatID, priorityTopStationsMessage(priorityStationNames, priorityStationScores), nil)
 	}
 }
 
-// priorityTopStationsMessage renders the top-10 re-ranked stations after
-// boosting priorityStations, shown once right after a subscription with
+// priorityTopStationsMessage renders the top-10 entries of the (already
+// normalized, best-first) priority-boosted station ranking computed and
+// stored in finalize, shown once right after a subscription with
 // ScoringModePriority is created.
-func priorityTopStationsMessage(priorityStations []string) string {
-	top := metro.TopStations(priorityStations, 10)
+func priorityTopStationsMessage(names []string, scores []float64) string {
+	top := 10
+	if top > len(names) {
+		top = len(names)
+	}
 	var sb strings.Builder
 	sb.WriteString("топ-10 станций с учетом Ваших приоритетов:\n")
-	for _, s := range top {
-		fmt.Fprintf(&sb, "%s: %.2f\n", s.Name, s.Score)
+	for i := 0; i < top; i++ {
+		fmt.Fprintf(&sb, "%s: %.2f\n", names[i], scores[i])
 	}
 	return strings.TrimRight(sb.String(), "\n")
 }

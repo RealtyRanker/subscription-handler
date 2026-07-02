@@ -34,7 +34,7 @@ func TestMatchStationNamesCaseAndYo(t *testing.T) {
 
 func TestMatchStationNamesFirstOccurrenceOnly(t *testing.T) {
 	idx := firstIndexByNormalizedName()
-	i, ok := idx[normalizeStationName("Белорусская")]
+	i, ok := idx[NormalizeStationName("Белорусская")]
 	if !ok || i != 34 {
 		t.Fatalf("expected first Белорусская occurrence at index 34, got %d (ok=%v)", i, ok)
 	}

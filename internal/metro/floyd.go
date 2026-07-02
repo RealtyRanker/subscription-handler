@@ -14,6 +14,12 @@ import (
 const (
 	inf = 100000.0
 	eps = 1e-7
+
+	// NumStations is the number of stations in the graph (matches the
+	// numStations constant in graph_data.go), exposed so callers can request
+	// a full ranking via TopStations(priorityNames, NumStations) and know how
+	// many entries to expect, or normalize scores by station count.
+	NumStations = numStations
 )
 
 // fictive maps a real station index to its paired fictive node index in the
@@ -120,9 +126,9 @@ func dist(d []float64, i, j int) float64 {
 	return direct
 }
 
-// normalizeStationName lowercases and folds ё/Ё to е/Е so station name
+// NormalizeStationName lowercases and folds ё/Ё to е/Е so station name
 // comparisons ignore case and treat "е" and "ё" as equal, as requested.
-func normalizeStationName(s string) string {
+func NormalizeStationName(s string) string {
 	s = strings.ReplaceAll(s, "ё", "е")
 	s = strings.ReplaceAll(s, "Ё", "Е")
 	return strings.ToLower(strings.TrimSpace(s))
@@ -141,7 +147,7 @@ func firstIndexByNormalizedName() map[string]int {
 	nameIndexOnce.Do(func() {
 		nameIndex = make(map[string]int, numStations)
 		for i := 0; i < numStations; i++ {
-			key := normalizeStationName(stationName[i])
+			key := NormalizeStationName(stationName[i])
 			if _, exists := nameIndex[key]; !exists {
 				nameIndex[key] = i
 			}
@@ -158,7 +164,7 @@ func MatchStationNames(names []string) (matched []string, unmatched []string) {
 	idx := firstIndexByNormalizedName()
 	seen := make(map[int]bool)
 	for _, raw := range names {
-		key := normalizeStationName(raw)
+		key := NormalizeStationName(raw)
 		if key == "" {
 			continue
 		}
@@ -197,7 +203,7 @@ func TopStations(priorityNames []string, count int) []StationScore {
 	}
 	priorityWeight := float64(numStations) / 2
 	for _, name := range priorityNames {
-		if i, ok := idx[normalizeStationName(name)]; ok {
+		if i, ok := idx[NormalizeStationName(name)]; ok {
 			w[i] = priorityWeight
 		}
 	}
@@ -229,4 +235,21 @@ func TopStations(priorityNames []string, count int) []StationScore {
 		result[i] = StationScore{Name: stationName[ans[i].idx], Score: ans[i].sum}
 	}
 	return result
+}
+
+// PlaceIndex ranks every station via TopStations(priorityNames, numStations)
+// and returns a normalized-name -> 1-indexed place lookup. When a station
+// name (e.g. "Белорусская") corresponds to multiple graph nodes across
+// different lines, the best (lowest) place among them wins, matching a
+// user's intuition that there's just one station of that name.
+func PlaceIndex(priorityNames []string) map[string]int {
+	ranking := TopStations(priorityNames, numStations)
+	idx := make(map[string]int, len(ranking))
+	for i, s := range ranking {
+		key := NormalizeStationName(s.Name)
+		if _, exists := idx[key]; !exists {
+			idx[key] = i + 1
+		}
+	}
+	return idx
 }
