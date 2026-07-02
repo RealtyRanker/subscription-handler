@@ -47,6 +47,7 @@ func main() {
 	}
 	defer database.Close()
 
+	logger.Info("loading bot token", zap.String("file", cfg.Telegram.BotTokenFile))
 	tgClient := telegram.NewClient(cfg.Telegram.BotToken)
 	sessions := session.NewStore()
 	bot := telegram.NewBot(tgClient, database, sessions, logger)

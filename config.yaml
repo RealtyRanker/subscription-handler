@@ -1,5 +1,5 @@
 telegram:
-  bot_token: "8252101510:AAFvo3HspxzKjXXflZ9-L3pyvJvgevYRtDI"
+  bot_token_file: "/etc/subscription-handler/bot_token"
 
 database:
   dsn: "postgres://realty_parser:password@realty-postgres:5432/realty_parser?sslmode=disable"
