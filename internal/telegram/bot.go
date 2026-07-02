@@ -101,7 +101,7 @@ var extendedStepQuestions = map[session.Step]string{
 // dealTypeLabels maps a stored deal_type to its human-readable Russian label.
 var dealTypeLabels = map[string]string{
 	session.DealTypeRent: "Аренда",
-	session.DealTypeSale: "Продажа",
+	session.DealTypeSale: "Покупка",
 }
 
 func dealTypeLabel(dealType string) string {
@@ -205,11 +205,6 @@ func (b *Bot) handleMessage(ctx context.Context, msg *Message) {
 	metrics.MessagesReceived.Inc()
 	chatID := msg.Chat.ID
 	text := strings.TrimSpace(msg.Text)
-
-	b.logger.Debug("message received",
-		zap.Int64("chat_id", chatID),
-		zap.String("text", text),
-	)
 
 	if strings.HasPrefix(text, "/") {
 		b.handleCommand(ctx, chatID, text)
@@ -1232,7 +1227,7 @@ func (b *Bot) answerCallback(ctx context.Context, callbackQueryID, text string) 
 func (b *Bot) sendDealTypeQuestion(ctx context.Context, chatID int64, kind string) {
 	markup := &InlineKeyboardMarkup{InlineKeyboard: [][]InlineKeyboardButton{
 		{{Text: "🏠 Аренда", CallbackData: "deal:" + session.DealTypeRent}},
-		{{Text: "💰 Продажа", CallbackData: "deal:" + session.DealTypeSale}},
+		{{Text: "💰 Покупка", CallbackData: "deal:" + session.DealTypeSale}},
 	}}
 	sess := &session.Session{Kind: kind}
 	text := fmt.Sprintf("Шаг %d/%d — Что вас интересует?", stepNumber(session.StepDealType, sess), totalSteps(sess))
